@@ -146,3 +146,6 @@ def logout():
         return jsonify({}), 200
     session.clear()
     return jsonify({'success': True})
+@app.route('/ping')
+def ping():
+    return jsonify({'status': 'ok'})
