@@ -1,3 +1,8 @@
+# =========================
+# ПРОКСИ-СЕРВЕР
+# Запусти: python proxy.py
+# Работает на http://0.0.0.0:5000
+# =========================
 from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
@@ -146,6 +151,11 @@ def logout():
         return jsonify({}), 200
     session.clear()
     return jsonify({'success': True})
+
+# ✅ Маршрут для пинга — не даёт серверу засыпать
 @app.route('/ping')
 def ping():
     return jsonify({'status': 'ok'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
