@@ -9,14 +9,19 @@ app.secret_key = 'super_secret_key_123'
 
 BASE_URL = 'https://account.str.uust.ru'
 EDU_URL  = 'https://edu.str.uust.ru'
+PHP_URL  = f'{EDU_URL}/php'
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept': '*/*',
     'Accept-Language': 'ru-RU,ru;q=0.9',
+    'Origin':  EDU_URL,
+    'Referer': EDU_URL + '/',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
 }
 
-# ─── CORS ───────────────────────────────────────────────────────────────────
+# ─── CORS ────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_cors(r):
     r.headers['Access-Control-Allow-Origin']  = '*'
@@ -24,21 +29,20 @@ def add_cors(r):
     r.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return r
 
-# ─── ВСПОМОГАЛКИ ────────────────────────────────────────────────────────────
-def edu_session():
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
 @app.route('/ping')
 def ping():
     return jsonify({'status': 'ok'})
 
+def edu_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.get(EDU_URL + '/', timeout=10)  # получаем куки сессии
+    return s
+
 # ─── AUTH ────────────────────────────────────────────────────────────────────
-@app.route('/api/login', methods=['POST', 'OPTIONS'])
+@app.route('/api/login', methods=['POST','OPTIONS'])
 def login():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
+    if request.method == 'OPTIONS': return jsonify({}), 200
     data = request.json or {}
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -47,8 +51,7 @@ def login():
         r = s.get(login_url, timeout=15)
         soup = BeautifulSoup(r.text, 'html.parser')
         form = soup.find('form')
-        if not form:
-            return jsonify({'success': False, 'error': 'Форма не найдена'})
+        if not form: return jsonify({'success': False, 'error': 'Форма не найдена'})
         payload = {i.get('name'): i.get('value','') for i in form.find_all('input') if i.get('name')}
         lf, pf = 'Email', 'Password'
         for k in payload:
@@ -123,49 +126,110 @@ def grades():
     except Exception as e:
         return jsonify({'error': str(e)})
 
-# ─── ДИАГНОСТИКА — ПОКАЗЫВАЕМ СЫРОЙ HTML И JS-ЗАПРОСЫ САЙТА ─────────────────
-@app.route('/api/debug/site', methods=['GET'])
-def debug_site():
+# ─── ЯДРО: поиск ID группы ───────────────────────────────────────────────────
+def find_group_id(s: requests.Session, group_name: str) -> tuple[str|None, str|None]:
     """
-    Вызови: GET /api/debug/site
-    Показывает сырой HTML главной страницы и все найденные JS/AJAX ссылки.
+    Ищет ID группы по имени. Перебирает возможные эндпоинты.
+    Возвращает (group_id, matched_name) или (None, None).
     """
-    s = edu_session()
+    name_lower = group_name.lower().strip()
+
+    # Эндпоинты которые могут вернуть список групп
+    # Часто нужно сначала передать ID факультета — пробуем перебрать faculty 1..20
+    endpoints_no_faculty = [
+        ('getGroups.php',    [{'type': 'group'}, {'type': '2'}, {}]),
+        ('getGroup.php',     [{}]),
+        ('getData.php',      [{'type': 'groups'}, {'type': 'group'}, {}]),
+        ('getFaculty.php',   [{}]),
+        ('getFaculties.php', [{}]),
+        ('search.php',       [{'query': group_name}, {'q': group_name}, {'name': group_name}]),
+    ]
+
+    for php, payloads in endpoints_no_faculty:
+        for payload in payloads:
+            try:
+                r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=8)
+                if r.status_code != 200 or len(r.text) < 10: continue
+                if 'not in allowlist' in r.text: continue
+                print(f'[FIND_ID] {php} payload={payload} -> len={len(r.text)} preview={r.text[:200]!r}')
+
+                gid = extract_group_id_from_response(r.text, name_lower)
+                if gid:
+                    return gid, group_name
+            except Exception as e:
+                print(f'[FIND_ID] {php} ошибка: {e}')
+                continue
+
+    # Пробуем с faculty_id от 1 до 15
+    for fid in range(1, 16):
+        for php in ['getGroups.php', 'getData.php']:
+            for payload in [
+                {'faculty': str(fid)},
+                {'faculty_id': str(fid)},
+                {'id': str(fid), 'type': 'groups'},
+                {'fac': str(fid)},
+            ]:
+                try:
+                    r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=6)
+                    if r.status_code != 200 or len(r.text) < 10: continue
+                    if 'not in allowlist' in r.text: continue
+
+                    gid = extract_group_id_from_response(r.text, name_lower)
+                    if gid:
+                        print(f'[FIND_ID] Нашли! faculty={fid} php={php}: group_id={gid}')
+                        return gid, group_name
+                except Exception:
+                    continue
+
+    return None, None
+
+
+def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
+    """Пытается достать ID группы из JSON или HTML ответа."""
+    # Пробуем JSON
     try:
-        r = s.get(f'{EDU_URL}/', timeout=12)
-        html = r.text
-        soup = BeautifulSoup(html, 'html.parser')
+        import json
+        data = json.loads(text)
+        # data может быть списком или словарём
+        items = data if isinstance(data, list) else data.get('groups', data.get('data', []))
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower()
+                    if name_lower in item_name or item_name in name_lower:
+                        return str(item.get('id') or item.get('group_id') or item.get('ID',''))
+        elif isinstance(items, dict):
+            for key, val in items.items():
+                if name_lower in str(val).lower():
+                    return str(key)
+    except Exception:
+        pass
 
-        # Ищем все src скриптов
-        scripts_src = [sc.get('src','') for sc in soup.find_all('script', src=True)]
+    # Пробуем HTML — ищем option или li с именем группы
+    try:
+        soup = BeautifulSoup(text, 'html.parser')
+        for opt in soup.find_all(['option','li','a','tr','td']):
+            opt_text = opt.get_text(strip=True).lower()
+            if name_lower in opt_text:
+                val = opt.get('value') or opt.get('data-id') or opt.get('id')
+                if val and val.isdigit():
+                    return val
+    except Exception:
+        pass
 
-        # Ищем упоминания URL внутри inline-скриптов
-        ajax_hints = []
-        for sc in soup.find_all('script'):
-            txt = sc.string or ''
-            # Любые строки с .php или fetch( или XMLHttp или ajax
-            urls = re.findall(r'["\']([^"\']*(?:\.php|ajax|api|schedule|rasp|grp)[^"\']*)["\']', txt, re.I)
-            ajax_hints.extend(urls)
+    return None
 
-        return jsonify({
-            'status':      r.status_code,
-            'html_length': len(html),
-            'raw_html':    html,            # <── главное! вставь это в ответе
-            'scripts_src': scripts_src,
-            'ajax_hints':  list(set(ajax_hints)),
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)})
 
-# ─── ВСПОМОГАЛКИ ДЛЯ ПАРСЕРА РАСПИСАНИЯ ─────────────────────────────────────
+# ─── ПАРСЕР РАСПИСАНИЯ ────────────────────────────────────────────────────────
 def parse_schedule_html(html: str, group: str) -> dict:
     soup = BeautifulSoup(html, 'html.parser')
+
     header = f'Расписание группы {group}'
-    for sel in ['.rasp_head','h1','h2']:
+    for sel in ['.rasp_head','h1','h2','.title','.schedule-title','caption']:
         el = soup.select_one(sel)
         if el:
-            header = el.get_text(' ', strip=True)
-            break
+            t = el.get_text(' ', strip=True)
+            if t and len(t) > 3: header = t; break
 
     days = [
         {'name':'Понедельник','header':'','lessons':[]},
@@ -175,47 +239,54 @@ def parse_schedule_html(html: str, group: str) -> dict:
         {'name':'Пятница',    'header':'','lessons':[]},
         {'name':'Суббота',    'header':'','lessons':[]},
     ]
+    DAY_NAMES = ['понедельник','вторник','среда','четверг','пятница','суббота']
+    DAY_SHORT  = ['пн','вт','ср','чт','пт','сб']
     has_data = False
+
     for table in soup.find_all('table'):
         rows = table.find_all('tr')
         if len(rows) < 2: continue
+
         hdr = rows[0].find_all(['th','td'])
         day_map = {}
         for ci, cell in enumerate(hdr):
-            txt = cell.get_text(strip=True)
-            for di, d in enumerate(days):
-                if d['name'][:2] in txt or d['name'] in txt:
+            txt = cell.get_text(strip=True).lower()
+            for di, (full, short) in enumerate(zip(DAY_NAMES, DAY_SHORT)):
+                if full in txt or txt.startswith(short):
                     day_map[ci] = di
-                    days[di]['header'] = txt
+                    days[di]['header'] = cell.get_text(strip=True)
+        if not day_map:
+            for ci in range(min(len(hdr), 6)):
+                day_map[ci] = ci
 
         for row in rows[1:]:
             cells = row.find_all('td')
             for ci, cell in enumerate(cells):
-                di = day_map.get(ci, ci if ci < 6 else None)
-                if di is None: continue
+                di = day_map.get(ci)
+                if di is None or di >= 6: continue
                 lines = [l.strip() for l in cell.get_text('\n').split('\n') if l.strip()]
                 if not lines: continue
                 if any(w in cell.get_text().lower() for w in ['отсутствует','пар нет']): continue
 
-                num=time_str=subject=teacher=room=''
-                rest=[]
+                num = time_str = subject = teacher = room = ''
+                rest = []
                 for ln in lines:
                     if re.search(r'\d{1,2}[:\.]\d{2}', ln): time_str = ln
                     elif re.match(r'^\d+[\.)]?\s*$', ln): num = ln.strip('.)').strip()
                     else: rest.append(ln)
-
                 if not rest and not time_str: continue
-                final=[]
+
+                final = []
                 for ln in rest:
-                    if re.search(r'\b(каб|ауд|гк|лк|пр|лаб|стад)\b', ln, re.I): room=ln
+                    if re.search(r'\b(каб|ауд|гк|лк|пр|лаб|стад|зал)\b', ln, re.I): room = ln
                     else: final.append(ln)
 
                 if final:
                     has_data = True
-                    b = cell.find(['b','strong'])
-                    if b:
-                        subject = b.get_text(strip=True)
-                        teacher = ', '.join(l for l in final if l.lower()!=subject.lower())
+                    bold = cell.find(['b','strong'])
+                    if bold:
+                        subject = bold.get_text(strip=True)
+                        teacher = ', '.join(l for l in final if l.lower() != subject.lower())
                     else:
                         subject = final[0]
                         teacher = ', '.join(final[1:])
@@ -223,10 +294,8 @@ def parse_schedule_html(html: str, group: str) -> dict:
                 if subject or time_str:
                     days[di]['lessons'].append({
                         'num': num or str(len(days[di]['lessons'])+1),
-                        'time': time_str,
-                        'subject': subject,
-                        'teacher': teacher,
-                        'room': room,
+                        'time': time_str, 'subject': subject,
+                        'teacher': teacher, 'room': room,
                     })
 
     for d in days:
@@ -235,59 +304,155 @@ def parse_schedule_html(html: str, group: str) -> dict:
     return {'header': header, 'days': days, 'success': has_data}
 
 
-# ─── РАСПИСАНИЕ — РЕАЛЬНЫЙ ЭНДПОИНТ ─────────────────────────────────────────
-# СЕЙЧАС ЗАГЛУШКА — нужно знать реальный AJAX-эндпоинт сайта
-# Вызови /api/debug/site и скинь html_preview + ajax_hints
-# Тогда я подставлю правильный URL и параметры
+def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_name: str) -> dict | None:
+    """
+    Вызывает getSheduleHeader.php (и тело если найдём) по ID группы.
+    Возвращает распарсенное расписание или None.
+    """
+    payload = {'id': group_id, 'week': week}
+
+    # Сначала пробуем получить тело расписания
+    body_endpoints = [
+        'getSheduleBody.php',
+        'getShedule.php',
+        'getSchedule.php',
+        'getSheduleData.php',
+        'getSheduleWeek.php',
+        'getScheduleBody.php',
+    ]
+    for ep in body_endpoints:
+        try:
+            r = s.post(f'{PHP_URL}/{ep}', data=payload, timeout=10)
+            print(f'[BODY] {ep} -> {r.status_code} len={len(r.text)} preview={r.text[:200]!r}')
+            if r.status_code == 200 and len(r.text) > 200 and 'not in allowlist' not in r.text:
+                parsed = parse_schedule_html(r.text, group_name)
+                if parsed['success']:
+                    print(f'[BODY] Успех с {ep}!')
+                    return parsed
+        except Exception as e:
+            print(f'[BODY] {ep} ошибка: {e}')
+
+    # Заголовок (может содержать неделю/даты)
+    try:
+        r = s.post(f'{PHP_URL}/getSheduleHeader.php', data=payload, timeout=10)
+        print(f'[HEADER] -> {r.status_code} len={len(r.text)} preview={r.text[:300]!r}')
+        if r.status_code == 200 and len(r.text) > 50 and 'not in allowlist' not in r.text:
+            parsed = parse_schedule_html(r.text, group_name)
+            if parsed['success']:
+                return parsed
+            # Ответ есть но таблицы нет — значит это только заголовок,
+            # данные надо брать из другого эндпоинта
+            # сохраняем заголовок и продолжаем искать тело
+    except Exception as e:
+        print(f'[HEADER] ошибка: {e}')
+
+    return None
+
+
+# ─── РАСПИСАНИЕ — ГЛАВНЫЙ ЭНДПОИНТ ───────────────────────────────────────────
 @app.route('/api/schedule/by_name', methods=['POST','OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS': return jsonify({}), 200
     data = request.json or {}
     group = data.get('group_name','').strip()
-    week  = str(data.get('week', '0'))
-    if not group:
-        return jsonify({'error': 'Не указана группа'})
+    week  = str(data.get('week','0'))
+    if not group: return jsonify({'error': 'Не указана группа'})
 
     s = edu_session()
 
-    # ── Попытка 1: прямой AJAX-запрос (заполни AJAX_URL когда узнаем из debug)
-    AJAX_URL = None  # ← СЮДА впишем реальный URL после debug
-    if AJAX_URL:
-        try:
-            r = s.post(AJAX_URL, data={'group': group, 'week': week}, timeout=12)
-            result = parse_schedule_html(r.text, group)
-            if result['success']:
-                return jsonify({'header': result['header'], 'days': result['days']})
-        except Exception as e:
-            print(f'[AJAX] Ошибка: {e}')
+    # ── Шаг 1: ищем ID группы
+    group_id, _ = find_group_id(s, group)
 
-    # ── Попытка 2: пробуем несколько самых вероятных URL (без перебора сотен)
-    candidates = [
-        f'{EDU_URL}/rasp/',
-        f'{EDU_URL}/schedule/',
-        f'{EDU_URL}/get_schedule.php',
-        f'{EDU_URL}/api/schedule',
-        f'{EDU_URL}/ajax.php',
-        f'{EDU_URL}/rasp.php',
-    ]
-    for url in candidates:
-        try:
-            r = s.post(url, data={'group': group, 'week': week}, timeout=8,
-                       headers={**HEADERS,'Referer':f'{EDU_URL}/'})
-            if r.status_code == 200 and len(r.text) > 5500:
-                result = parse_schedule_html(r.text, group)
-                if result['success']:
-                    print(f'[FOUND] Работает URL: {url}')
-                    return jsonify({'header': result['header'], 'days': result['days']})
-        except Exception:
-            continue
+    if not group_id:
+        return jsonify({
+            'header': f'Группа "{group}" не найдена',
+            'days': [],
+            'debug': {
+                'message': 'Не удалось найти ID группы. Вызови /api/debug/find_group?group=4М21',
+            }
+        })
 
-    # ── Ничего не нашли
+    print(f'[SCHEDULE] Нашли group_id={group_id} для группы {group}')
+
+    # ── Шаг 2: получаем расписание по ID
+    result = call_schedule_by_id(s, group_id, week, group)
+
+    if result and result['success']:
+        return jsonify({'header': result['header'], 'days': result['days']})
+
     return jsonify({
         'header': f'Расписание группы "{group}" не найдено',
         'days': [],
-        'hint': 'Нужно вызвать /api/debug/site чтобы найти реальный AJAX эндпоинт'
+        'debug': {'group_id': group_id, 'week': week}
     })
+
+
+# ─── ЭНДПОИНТ ДЛЯ ПРЯМОГО ВЫЗОВА ПО ИЗВЕСТНОМУ ID ────────────────────────────
+@app.route('/api/schedule/by_id', methods=['POST','OPTIONS'])
+def schedule_by_id():
+    """
+    Используй этот эндпоинт если знаешь ID группы.
+    POST { "group_id": "10155", "group_name": "4М21", "week": "0" }
+    """
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    data = request.json or {}
+    group_id   = str(data.get('group_id','')).strip()
+    group_name = data.get('group_name', f'группа {group_id}')
+    week       = str(data.get('week','0'))
+    if not group_id: return jsonify({'error': 'Не указан group_id'})
+
+    s = edu_session()
+    result = call_schedule_by_id(s, group_id, week, group_name)
+
+    if result and result['success']:
+        return jsonify({'header': result['header'], 'days': result['days']})
+
+    return jsonify({
+        'header': f'Расписание не найдено (id={group_id})',
+        'days': [],
+        'debug': {'group_id': group_id, 'week': week}
+    })
+
+
+# ─── ДИАГНОСТИКА: что возвращает getSheduleHeader с реальным ID ───────────────
+@app.route('/api/debug/find_group', methods=['GET'])
+def debug_find_group():
+    """GET /api/debug/find_group?group=4М21"""
+    group = request.args.get('group','4М21')
+    week  = request.args.get('week','0')
+    s = edu_session()
+
+    results = {}
+
+    # Сразу пробуем getSheduleHeader с известным ID для теста
+    test_ids = ['10155']  # <── ID из DevTools
+    for gid in test_ids:
+        for ep in ['getSheduleHeader.php','getSheduleBody.php','getShedule.php','getSchedule.php']:
+            try:
+                r = s.post(f'{PHP_URL}/{ep}', data={'id': gid, 'week': week}, timeout=8)
+                results[f'{ep}(id={gid})'] = {
+                    'status': r.status_code,
+                    'length': len(r.text),
+                    'preview': r.text[:600],
+                }
+            except Exception as e:
+                results[f'{ep}(id={gid})'] = {'error': str(e)}
+
+    # Пробуем найти список групп
+    for ep in ['getGroups.php','getData.php','getFaculties.php']:
+        for payload in [{}, {'type':'groups'}, {'type':'group'}]:
+            try:
+                r = s.post(f'{PHP_URL}/{ep}', data=payload, timeout=8)
+                if r.status_code == 200 and len(r.text) > 10 and 'not in allowlist' not in r.text:
+                    results[f'{ep}(payload={payload})'] = {
+                        'status': r.status_code,
+                        'length': len(r.text),
+                        'preview': r.text[:600],
+                    }
+            except Exception:
+                pass
+
+    return jsonify({'results': results})
 
 
 if __name__ == '__main__':
