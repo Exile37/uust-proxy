@@ -9,7 +9,6 @@ app.secret_key = 'super_secret_key_123'
 
 BASE_URL = 'https://account.str.uust.ru'
 EDU_URL  = 'https://edu.str.uust.ru'
-PHP_URL  = f'{EDU_URL}/php'
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -20,7 +19,11 @@ HEADERS = {
     'X-Requested-With': 'XMLHttpRequest',
 }
 
-# ─── CORS ────────────────────────────────────────────────────────────────────
+AUTH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+}
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_cors(r):
     r.headers['Access-Control-Allow-Origin']  = '*'
@@ -32,16 +35,16 @@ def add_cors(r):
 def ping():
     return jsonify({'status': 'ok'})
 
-# ─── AUTH (ЛИЧНЫЙ КАБИНЕТ) ───────────────────────────────────────────────────
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
 @app.route('/api/login', methods=['POST','OPTIONS'])
 def login():
     if request.method == 'OPTIONS': return jsonify({}), 200
     data = request.json or {}
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update(AUTH_HEADERS)
     try:
         login_url = f'{BASE_URL}/Account/Login'
-        r = s.get(login_url, timeout=10)
+        r = s.get(login_url, timeout=15)
         soup = BeautifulSoup(r.text, 'html.parser')
         form = soup.find('form')
         if not form: return jsonify({'success': False, 'error': 'Форма не найдена'})
@@ -52,8 +55,8 @@ def login():
             if 'pass' in k.lower(): pf = k
         payload[lf] = data.get('username')
         payload[pf] = data.get('password')
-        resp = s.post(login_url, data=payload, headers={**HEADERS,'Referer':login_url},
-                      allow_redirects=True, timeout=10)
+        resp = s.post(login_url, data=payload, headers={**AUTH_HEADERS,'Referer':login_url},
+                      allow_redirects=True, timeout=15)
         if any('.AspNet' in c.name for c in s.cookies) or 'Выйти' in resp.text:
             session['cookies'] = requests.utils.dict_from_cookiejar(s.cookies)
             return jsonify({'success': True})
@@ -67,16 +70,16 @@ def logout():
     session.clear()
     return jsonify({'success': True})
 
-# ─── ПРЕДМЕТЫ И ОЦЕНКИ ───────────────────────────────────────────────────────
+# ─── ПРЕДМЕТЫ И ОЦЕНКИ ────────────────────────────────────────────────────────
 @app.route('/api/subjects', methods=['GET','OPTIONS'])
 def subjects():
     if request.method == 'OPTIONS': return jsonify({}), 200
     if 'cookies' not in session: return jsonify({'error': 'auth'}), 401
     s = requests.Session()
     s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
-    s.headers.update(HEADERS)
+    s.headers.update(AUTH_HEADERS)
     try:
-        soup = BeautifulSoup(s.get(f'{BASE_URL}/Journals/DisciplinesStudent', timeout=10).text, 'html.parser')
+        soup = BeautifulSoup(s.get(f'{BASE_URL}/Journals/DisciplinesStudent', timeout=15).text, 'html.parser')
         result = []
         for link in soup.find_all('a', href=True):
             if '/Journals/DisciplineGrades' not in link['href']: continue
@@ -84,7 +87,7 @@ def subjects():
             if not row: continue
             cells = row.find_all('td')
             result.append({
-                'name':   cells[1].get_text(strip=True) if len(cells)>1 else '—',
+                'name':    cells[1].get_text(strip=True) if len(cells)>1 else '—',
                 'semestr': cells[2].get_text(strip=True) if len(cells)>2 else '—',
                 'teacher': cells[3].get_text(strip=True) if len(cells)>3 else '—',
                 'url':     link['href'],
@@ -101,9 +104,9 @@ def grades():
     if not url.startswith('/Journals/'): return jsonify({'error': 'неверный URL'})
     s = requests.Session()
     s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
-    s.headers.update(HEADERS)
+    s.headers.update(AUTH_HEADERS)
     try:
-        soup = BeautifulSoup(s.get(urljoin(BASE_URL, url), timeout=10).text, 'html.parser')
+        soup = BeautifulSoup(s.get(urljoin(BASE_URL, url), timeout=15).text, 'html.parser')
         lessons = []
         table = soup.find('table')
         if table:
@@ -114,225 +117,120 @@ def grades():
                 if not date or 'Дата' in date: continue
                 content = cells[2].get_text(separator=' ', strip=True)
                 theme = content.split('Домашнее задание:')[0].replace('Тема:','').strip()
-                lessons.append({'date':date,'theme':theme or 'Занятие','grade':cells[-1].get_text(strip=True) or '-'})
+                lessons.append({
+                    'date': date,
+                    'theme': theme or 'Занятие',
+                    'grade': cells[-1].get_text(strip=True) or '-'
+                })
         return jsonify({'lessons': lessons})
     except Exception as e:
         return jsonify({'error': str(e)})
 
+# ─── РАСПИСАНИЕ ───────────────────────────────────────────────────────────────
 
-# ─── ОТЛАДОЧНЫЙ ПОИСК ID ГРУППЫ ──────────────────────────────────────────────
-def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
-    name_lower = group_name.lower().strip()
-    clean_name = name_lower.replace('к-', '').strip()
-    logs = {'attempts': []}
-    
-    s = requests.Session()
-    s.headers.update(HEADERS)
-
-    # Принудительно проверяем факультет 26, затем остальные (1-40)
-    faculty_ids = [26] + [i for i in range(1, 41) if i != 26]
-
-    for fid in faculty_ids:
-        try:
-            r = s.get(f'{PHP_URL}/getList.php', params={'faculty': str(fid)}, timeout=3)
-            
-            # ОТЛАДКА: выводим ответ от сервера в логи Render
-            if fid == 26:
-                print("======== [DEBUG] ОТВЕТ ОТ GETLIST (FACULTY 26) ========")
-                print(r.text[:1000])
-                print("=======================================================")
-            
-            if r.status_code == 200 and "cannot select db" not in r.text.lower():
-                gid = extract_group_id_from_response(r.text, name_lower)
-                if not gid and clean_name != name_lower:
-                    gid = extract_group_id_from_response(r.text, clean_name)
-                    
-                if gid:
-                    print(f'[FIND_ID] Найдено на факультете {fid}! ID: {gid}')
-                    return gid, group_name, logs
-        except Exception as e:
-            continue
-
-    return None, None, logs
-
-
-def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
+@app.route('/api/schedule/groups', methods=['GET','OPTIONS'])
+def schedule_groups():
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    faculty = request.args.get('faculty', '26')
     try:
-        import json
-        data = json.loads(text)
-        items = data if isinstance(data, list) else data.get('groups', data.get('data', []))
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower().strip()
-                    if name_lower in item_name or item_name in name_lower:
-                        return str(item.get('id') or item.get('group_id') or item.get('ID',''))
-        elif isinstance(items, dict):
-            for key, val in items.items():
-                if name_lower in str(val).lower():
-                    return str(key)
-    except Exception:
-        pass
+        r = requests.get(
+            f'{EDU_URL}/getList.php?faculty={faculty}',
+            headers=HEADERS, timeout=15
+        )
+        html = r.text
+        groups = []
+        # Формат: <div style = 'display: none;'>ID</div><a ...>NAME</a>
+        # (с пробелами вокруг =)
+        pattern = re.compile(
+            r"<div[^>]*display\s*:\s*none[^>]*>\s*(\d+)\s*</div>\s*<a[^>]*>([^<]+)</a>",
+            re.IGNORECASE
+        )
+        for m in pattern.finditer(html):
+            groups.append({'id': m.group(1).strip(), 'name': m.group(2).strip()})
+        return jsonify({'groups': groups})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
+@app.route('/api/schedule/week_header', methods=['GET','OPTIONS'])
+def schedule_week_header():
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    group_id = request.args.get('id')
+    week = request.args.get('week', '0')
     try:
-        soup = BeautifulSoup(text, 'html.parser')
-        for opt in soup.find_all(['option', 'li', 'a']):
-            opt_text = opt.get_text(strip=True).lower()
-            if name_lower in opt_text:
-                val = opt.get('value') or opt.get('data-id') or opt.get('id')
-                if val and val.isdigit():
-                    return val
-    except Exception:
-        pass
+        r = requests.get(
+            f'{EDU_URL}/getSheduleHeader.php?type=2&id={group_id}&week={week}',
+            headers=HEADERS, timeout=15
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)
+        return jsonify({'header': text})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
-    return None
-
-
-# ─── ПАРСЕР РАСПИСАНИЯ ────────────────────────────────────────────────────────
-def parse_schedule_html(html: str, group: str) -> dict:
-    soup = BeautifulSoup(html, 'html.parser')
-    header = f'Расписание группы {group}'
-    for sel in ['.rasp_head','h1','h2','.title','.schedule-title','caption']:
-        el = soup.select_one(sel)
-        if el:
-            t = el.get_text(' ', strip=True)
-            if t and len(t) > 3: header = t; break
-
-    days = [
-        {'name':'Понедельник','header':'','lessons':[]},
-        {'name':'Вторник',    'header':'','lessons':[]},
-        {'name':'Среда',      'header':'','lessons':[]},
-        {'name':'Четверг',    'header':'','lessons':[]},
-        {'name':'Пятница',    'header':'','lessons':[]},
-        {'name':'Суббота',    'header':'','lessons':[]},
-    ]
-    DAY_NAMES = ['понедельник','вторник','среда','четверг','пятница','суббота']
-    DAY_SHORT  = ['пн','вт','ср','чт','пт','сб']
-    has_data = False
-
-    for table in soup.find_all('table'):
+@app.route('/api/schedule/timetable', methods=['GET','OPTIONS'])
+def schedule_timetable():
+    if request.method == 'OPTIONS': return jsonify({}), 200
+    group_id = request.args.get('id')
+    week = request.args.get('week', '0')
+    try:
+        r = requests.get(
+            f'{EDU_URL}/getShedule.php?type=2&id={group_id}&week={week}',
+            headers=HEADERS, timeout=15
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        days = [
+            {'name':'Понедельник','header':'','lessons':[]},
+            {'name':'Вторник',    'header':'','lessons':[]},
+            {'name':'Среда',      'header':'','lessons':[]},
+            {'name':'Четверг',    'header':'','lessons':[]},
+            {'name':'Пятница',    'header':'','lessons':[]},
+            {'name':'Суббота',    'header':'','lessons':[]},
+        ]
+        table = soup.find('table')
+        if not table:
+            return jsonify({'days': days})
         rows = table.find_all('tr')
-        if len(rows) < 2: continue
 
-        hdr = rows[0].find_all(['th','td'])
-        day_map = {}
-        for ci, cell in enumerate(hdr):
-            txt = cell.get_text(strip=True).lower()
-            for di, (full, short) in enumerate(zip(DAY_NAMES, DAY_SHORT)):
-                if full in txt or txt.startswith(short):
-                    day_map[ci] = di
-                    days[di]['header'] = cell.get_text(strip=True)
-        if not day_map:
-            for ci in range(min(len(hdr), 6)):
-                day_map[ci] = ci
+        # Заголовки дней
+        if rows:
+            headers = rows[0].find_all('th')
+            for i, th in enumerate(headers):
+                if i < len(days):
+                    days[i]['header'] = th.get_text(strip=True)
 
+        # Пары
         for row in rows[1:]:
             cells = row.find_all('td')
-            for ci, cell in enumerate(cells):
-                di = day_map.get(ci)
-                if di is None or di >= 6: continue
-                lines = [l.strip() for l in cell.get_text('\n').split('\n') if l.strip()]
-                if not lines: continue
-                if any(w in cell.get_text().lower() for w in ['отсутствует','пар нет']): continue
+            for i, cell in enumerate(cells):
+                if i >= len(days): break
+                text = cell.get_text(separator='\n', strip=True)
+                if not text: continue
 
-                num = time_str = subject = teacher = room = ''
-                rest = []
-                for ln in lines:
-                    if re.search(r'\d{1,2}[:\.]\d{2}', ln): time_str = ln
-                    elif re.match(r'^\d+[\.)]?\s*$', ln): num = ln.strip('.)').strip()
-                    else: rest.append(ln)
-                if not rest and not time_str: continue
+                cell_html = str(cell)
+                time_match = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', cell_html)
+                time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ''
 
-                final = []
-                for ln in rest:
-                    if re.search(r'\b(каб|ауд|гк|лк|пр|лаб|стад|зал)\b', ln, re.I): room = ln
-                    else: final.append(ln)
+                num_match = re.match(r'^(\d+)\.', text)
+                num = num_match.group(1) if num_match else ''
 
-                if final:
-                    has_data = True
-                    bold = cell.find(['b','strong'])
-                    if bold:
-                        subject = bold.get_text(strip=True)
-                        teacher = ', '.join(l for l in final if l.lower() != subject.lower())
-                    else:
-                        subject = final[0]
-                        if len(final) > 1:
-                            teacher = ', '.join(final[1:])
+                room_match = re.search(r'(?:Пр|пр)\s*([^\s<,\n]+)', cell_html)
+                room = room_match.group(1) if room_match else ''
+
+                bold = cell.find('b') or cell.find('strong')
+                subject = bold.get_text(strip=True) if bold else ''
+
+                teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)', text)
+                teacher = teacher_match.group(1) if teacher_match else ''
 
                 if subject or time_str:
-                    days[di]['lessons'].append({
-                        'num': num or str(len(days[di]['lessons'])+1),
-                        'time': time_str, 'subject': subject,
-                        'teacher': teacher, 'room': room,
+                    days[i]['lessons'].append({
+                        'num': num,
+                        'time': time_str,
+                        'subject': subject,
+                        'teacher': teacher,
+                        'room': room,
                     })
 
-    for d in days:
-        d['lessons'].sort(key=lambda x: x['num'].zfill(2))
-
-    return {'header': header, 'days': days, 'success': has_data}
-
-
-def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
-    payload = {'id': group_id, 'week': week}
-    endpoints = ['getShedule.php', 'getSheduleBody.php', 'getScheduleBody.php']
-    
-    for ep in endpoints:
-        try:
-            r = requests.post(f'{PHP_URL}/{ep}', data=payload, headers=HEADERS, timeout=4)
-            if r.status_code == 200 and len(r.text) > 200 and "cannot select db" not in r.text.lower():
-                parsed = parse_schedule_html(r.text, group_name)
-                if parsed['success']: return parsed
-        except Exception:
-            continue
-    return None
-
-
-# ─── ГЛАВНЫЙ ЭНДПОИНТ ────────────────────────────────────────────────────────
-@app.route('/api/schedule/by_name', methods=['POST','OPTIONS'])
-def schedule_by_name():
-    if request.method == 'OPTIONS': return jsonify({}), 200
-    data = request.json or {}
-    group = data.get('group_name','').strip()
-    week  = str(data.get('week','0'))
-    if not group: return jsonify({'error': 'Не указана группа'})
-
-    group_id, _, diagnostic_logs = find_group_id(group)
-
-    if not group_id:
-        return jsonify({
-            'header': f'Группа "{group}" не найдена',
-            'days': [],
-            'debug_server_logs': diagnostic_logs
-        })
-
-    result = call_schedule_by_id(group_id, week, group)
-
-    if result and result['success']:
-        return jsonify({'header': result['header'], 'days': result['days']})
-
-    return jsonify({
-        'header': f'Расписание для группы {group} временно недоступно',
-        'days': [],
-        'debug_server_logs': diagnostic_logs
-    })
-
-
-@app.route('/api/schedule/by_id', methods=['POST','OPTIONS'])
-def schedule_by_id():
-    if request.method == 'OPTIONS': return jsonify({}), 200
-    data = request.json or {}
-    group_id   = str(data.get('group_id','')).strip()
-    group_name = data.get('group_name', f'группа {group_id}')
-    week       = str(data.get('week','0'))
-    if not group_id: return jsonify({'error': 'Не указан group_id'})
-
-    result = call_schedule_by_id(group_id, week, group_name)
-
-    if result and result['success']:
-        return jsonify({'header': result['header'], 'days': result['days']})
-
-    return jsonify({'header': f'Расписание не найдено (id={group_id})', 'days': []})
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+        return jsonify({'days': days})
+    except Exception as e:
+        return jsonify({'error': str(e)})
