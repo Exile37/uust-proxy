@@ -1,17 +1,16 @@
-# =========================
-# ПРОКСИ-СЕРВЕР
-# Запусти: python proxy.py
-# Работает на http://0.0.0.0:5000
-# =========================
+
 from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+import re
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_123'
 
 BASE_URL = 'https://account.str.uust.ru'
+EDU_URL = 'https://edu.str.uust.ru'
+
 HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -20,12 +19,21 @@ HEADERS = {
     )
 }
 
+EDU_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Referer': EDU_URL,
+}
+
 @app.after_request
 def add_cors(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
+
+@app.route('/ping')
+def ping():
+    return jsonify({'status': 'ok'})
 
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
@@ -152,10 +160,121 @@ def logout():
     session.clear()
     return jsonify({'success': True})
 
-# ✅ Маршрут для пинга — не даёт серверу засыпать
-@app.route('/ping')
-def ping():
-    return jsonify({'status': 'ok'})
+# =========================
+# РАСПИСАНИЕ
+# =========================
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+@app.route('/api/schedule/groups', methods=['GET', 'OPTIONS'])
+def schedule_groups():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    faculty = request.args.get('faculty', '26')
+    try:
+        r = requests.get(
+            f'{EDU_URL}/getList.php?faculty={faculty}',
+            headers=EDU_HEADERS, timeout=15
+        )
+        html = r.text
+        groups = []
+        pattern = re.compile(
+            r"<div[^>]*display:\s*none[^>]*>(\d+)</div>\s*<a[^>]*>([^<]+)</a>",
+            re.IGNORECASE
+        )
+        for m in pattern.finditer(html):
+            groups.append({'id': m.group(1), 'name': m.group(2).strip()})
+        return jsonify({'groups': groups})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/schedule/week_header', methods=['GET', 'OPTIONS'])
+def schedule_week_header():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    group_id = request.args.get('id')
+    week = request.args.get('week', '0')
+    try:
+        r = requests.get(
+            f'{EDU_URL}/getSheduleHeader.php?type=2&id={group_id}&week={week}',
+            headers=EDU_HEADERS, timeout=15
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)
+        return jsonify({'header': text})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/schedule/timetable', methods=['GET', 'OPTIONS'])
+def schedule_timetable():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    group_id = request.args.get('id')
+    week = request.args.get('week', '0')
+    try:
+        r = requests.get(
+            f'{EDU_URL}/getShedule.php?type=2&id={group_id}&week={week}',
+            headers=EDU_HEADERS, timeout=15
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        days = [
+            {'name': 'Понедельник', 'lessons': []},
+            {'name': 'Вторник', 'lessons': []},
+            {'name': 'Среда', 'lessons': []},
+            {'name': 'Четверг', 'lessons': []},
+            {'name': 'Пятница', 'lessons': []},
+            {'name': 'Суббота', 'lessons': []},
+        ]
+        table = soup.find('table')
+        if not table:
+            return jsonify({'days': days})
+        rows = table.find_all('tr')
+
+        # Заголовки дней
+        if rows:
+            headers = rows[0].find_all('th')
+            for i, th in enumerate(headers):
+                if i < len(days):
+                    days[i]['header'] = th.get_text(strip=True)
+
+        # Пары
+        for row in rows[1:]:
+            cells = row.find_all('td')
+            for i, cell in enumerate(cells):
+                if i >= len(days):
+                    break
+                text = cell.get_text(separator='\n', strip=True)
+                if not text:
+                    continue
+
+                # Время
+                time_match = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', cell.decode_contents())
+                time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ''
+
+                # Номер пары
+                num_match = re.match(r'^(\d+)\.', text)
+                num = num_match.group(1) if num_match else ''
+
+                # Аудитория
+                room_match = re.search(r'(?:Пр|пр)\s*([^\s<,\n]+)', cell.decode_contents())
+                room = room_match.group(1) if room_match else ''
+
+                # Предмет (жирный)
+                bold = cell.find('b') or cell.find('strong')
+                subject = bold.get_text(strip=True) if bold else ''
+
+                # Преподаватель
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)', text)
+                teacher = teacher_match.group(1) if teacher_match else ''
+
+                if subject or time_str:
+                    days[i]['lessons'].append({
+                        'num': num,
+                        'time': time_str,
+                        'subject': subject,
+                        'teacher': teacher,
+                        'room': room,
+                    })
+
+        return jsonify({'days': days})
+    except Exception as e:
+        return jsonify({'error': str(e)})
