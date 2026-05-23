@@ -11,6 +11,7 @@ BASE_URL = 'https://account.str.uust.ru'
 EDU_URL  = 'https://edu.str.uust.ru'
 PHP_URL  = f'{EDU_URL}/php'
 
+# Обновленные заголовки, имитирующие чистый запрос из браузера
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -19,6 +20,9 @@ HEADERS = {
     'Referer': EDU_URL + '/',
     'X-Requested-With': 'XMLHttpRequest',
     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin'
 }
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
@@ -29,45 +33,9 @@ def add_cors(r):
     r.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return r
 
-# ─── РАСШИРЕННЫЙ ДИАГНОСТИЧЕСКИЙ ПИНГ ────────────────────────────────────────
 @app.route('/ping')
 def ping():
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    debug_info = {}
-    try:
-        r = s.get(f'{EDU_URL}/index.php', timeout=5)
-        debug_info['status_code'] = r.status_code
-        debug_info['received_cookies'] = requests.utils.dict_from_cookiejar(s.cookies)
-        debug_info['html_preview'] = r.text[:400].replace('\n', ' ').strip()
-    except Exception as e:
-        debug_info['error'] = str(e)
-        
-    return jsonify({
-        'status': 'ok',
-        'render_to_uust_diagnostic': debug_info
-    })
-
-def edu_session():
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    
-    # Если студент уже авторизован в ЛК, берем его куки
-    if 'cookies' in session:
-        s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
-        print(f'[SESSION_INIT] Используем куки авторизованного пользователя.')
-        return s
-        
-    try:
-        # Пробуем выбить куку PHPSESSID через index.php или страницу расписания
-        r = s.get(f'{EDU_URL}/index.php', timeout=5)
-        if not s.cookies:
-            s.get(f'{EDU_URL}/?page=rasp', timeout=5)
-            
-        print(f'[SESSION_INIT] Холодный запуск. Статус: {r.status_code}, Куки: {requests.utils.dict_from_cookiejar(s.cookies)}')
-    except Exception as e:
-        print(f'[SESSION_INIT] Ошибка инициализации: {e}')
-    return s
+    return jsonify({'status': 'ok'})
 
 # ─── AUTH (ЛИЧНЫЙ КАБИНЕТ) ───────────────────────────────────────────────────
 @app.route('/api/login', methods=['POST','OPTIONS'])
@@ -157,56 +125,49 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── ЯДРО: ПОИСК ID ГРУППЫ ───────────────────────────────────────────────────
-def find_group_id(s: requests.Session, group_name: str) -> tuple[str|None, str|None, dict]:
-    """
-    Ищет ID группы по имени. Возвращает (group_id, matched_name, log_details).
-    """
+# ─── ЯДРО: ПОИСК ID ГРУППЫ (БЕЗ КУК И СЕССИЙ) ────────────────────────────────
+def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
-    logs = {'session_cookies': requests.utils.dict_from_cookiejar(s.cookies), 'attempts': []}
+    logs = {'attempts': []}
 
     endpoints_no_faculty = [
         ('getGroups.php',    [{'type': 'group'}, {'type': '2'}, {}]),
         ('getGroup.php',     [{}]),
         ('getData.php',      [{'type': 'groups'}, {'type': 'group'}, {}]),
-        ('getFaculty.php',   [{}]),
-        ('getFaculties.php', [{}]),
-        ('search.php',       [{'query': group_name}, {'q': group_name}, {'name': group_name}]),
+        ('search.php',       [{'query': group_name}, {'q': group_name}]),
     ]
 
+    # Прямые независимые POST-запросы без объекта Session
     for php, payloads in endpoints_no_faculty:
         for payload in payloads:
             try:
-                r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=4)
+                r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=4)
                 preview = r.text[:150].strip()
                 logs['attempts'].append({'url': f'{php}', 'payload': payload, 'status': r.status_code, 'preview': preview})
                 
                 if "cannot select db" in r.text.lower():
-                    raise RuntimeError(f"Университет вернул 'Cannot select db' на эндпоинте {php}")
+                    continue # Пропускаем битый эндпоинт, ищем дальше
                 
                 if r.status_code != 200 or len(r.text) < 10: continue
-                if 'not in allowlist' in r.text: continue
-
                 gid = extract_group_id_from_response(r.text, name_lower)
                 if gid:
                     return gid, group_name, logs
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 logs['attempts'].append({'url': f'{php}', 'error': str(e)})
                 continue
 
+    # Перебор по ID факультетов
     for fid in range(1, 16):
         for php in ['getGroups.php', 'getData.php']:
             for payload in [{'faculty': str(fid)}, {'faculty_id': str(fid)}, {'id': str(fid), 'type': 'groups'}]:
                 try:
-                    r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=3)
-                    if "cannot select db" in r.text.lower():
-                        raise RuntimeError(f"Университет вернул 'Cannot select db' на {php} с факультетом {fid}")
-                        
-                    if r.status_code != 200 or len(r.text) < 10: continue
+                    r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=3)
+                    if "cannot select db" in r.text.lower() or r.status_code != 200: 
+                        continue
                     gid = extract_group_id_from_response(r.text, name_lower)
                     if gid:
                         return gid, group_name, logs
-                except requests.exceptions.RequestException:
+                except Exception:
                     continue
 
     return None, None, logs
@@ -247,7 +208,6 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
 # ─── ПАРСЕР РАСПИСАНИЯ ────────────────────────────────────────────────────────
 def parse_schedule_html(html: str, group: str) -> dict:
     soup = BeautifulSoup(html, 'html.parser')
-
     header = f'Расписание группы {group}'
     for sel in ['.rasp_head','h1','h2','.title','.schedule-title','caption']:
         el = soup.select_one(sel)
@@ -329,7 +289,7 @@ def parse_schedule_html(html: str, group: str) -> dict:
     return {'header': header, 'days': days, 'success': has_data}
 
 
-def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_name: str) -> dict | None:
+def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
     payload = {'id': group_id, 'week': week}
     body_endpoints = [
         'getSheduleBody.php', 'getShedule.php', 'getSchedule.php',
@@ -337,8 +297,8 @@ def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_nam
     ]
     for ep in body_endpoints:
         try:
-            r = s.post(f'{PHP_URL}/{ep}', data=payload, timeout=5)
-            if "cannot select db" in r.text.lower(): return None
+            r = requests.post(f'{PHP_URL}/{ep}', data=payload, headers=HEADERS, timeout=5)
+            if "cannot select db" in r.text.lower(): continue
             if r.status_code == 200 and len(r.text) > 200 and 'not in allowlist' not in r.text:
                 parsed = parse_schedule_html(r.text, group_name)
                 if parsed['success']: return parsed
@@ -346,9 +306,8 @@ def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_nam
             continue
 
     try:
-        r = s.post(f'{PHP_URL}/getSheduleHeader.php', data=payload, timeout=5)
-        if "cannot select db" in r.text.lower(): return None
-        if r.status_code == 200 and len(r.text) > 50 and 'not in allowlist' not in r.text:
+        r = requests.post(f'{PHP_URL}/getSheduleHeader.php', data=payload, headers=HEADERS, timeout=5)
+        if r.status_code == 200 and len(r.text) > 50 and "cannot select db" not in r.text.lower():
             parsed = parse_schedule_html(r.text, group_name)
             if parsed['success']: return parsed
     except Exception:
@@ -357,7 +316,7 @@ def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_nam
     return None
 
 
-# ─── ГЛАВНЫЙ ЭНДПОИНТ (С АВАРИЙНЫМ ОБХОДОМ БЕЗ КУК) ───────────────────────────
+# ─── ГЛАВНЫЙ ЭНДПОИНТ (ПОЛНОСТЬЮ СТАТИЧНЫЙ) ──────────────────────────────────
 @app.route('/api/schedule/by_name', methods=['POST','OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -366,55 +325,29 @@ def schedule_by_name():
     week  = str(data.get('week','0'))
     if not group: return jsonify({'error': 'Не указана группа'})
 
-    s = edu_session()
-    diagnostic_logs = {}
-
-    try:
-        group_id, _, diagnostic_logs = find_group_id(s, group)
-    except RuntimeError as db_error:
-        print("[SCHEDULE] Сессия упала с 'Cannot select db!', пробуем аварийный пустой запрос...")
-        try:
-            # Трюк: Если бэк вуза багается на пустые сессии, пробуем совсем чистый сессионный поток
-            clean_session = requests.Session()
-            clean_session.headers.update(HEADERS)
-            group_id, _, backup_logs = find_group_id(clean_session, group)
-            s = clean_session
-            diagnostic_logs = backup_logs
-        except Exception:
-            return jsonify({
-                'header': 'Ошибка сессии СФ УУНиТ',
-                'days': [{
-                    'name': 'Диагностика', 'header': '',
-                    'lessons': [{
-                        'num': '!', 'time': '--:--',
-                        'subject': 'Сервер вуза сбросил сессию (Cannot select db).',
-                        'teacher': 'Пожалуйста, сначала зайдите в свой профиль в приложении.', 'room': 'APP'
-                    }]
-                }],
-                'debug_server_logs': diagnostic_logs
-            })
+    # Ищем ID без использования сессий
+    group_id, _, diagnostic_logs = find_group_id(group)
 
     if not group_id:
         return jsonify({
-            'header': f'Группа "{group}" не найдена',
+            'header': f'Группа "{group}" не найдена или сервер вуза перегружен',
             'days': [],
             'debug_server_logs': diagnostic_logs
         })
 
-    print(f'[SCHEDULE] Нашли group_id={group_id} для группы {group}')
-    result = call_schedule_by_id(s, group_id, week, group)
+    print(f'[SCHEDULE] Успешно получен group_id={group_id}')
+    result = call_schedule_by_id(group_id, week, group)
 
     if result and result['success']:
         return jsonify({'header': result['header'], 'days': result['days']})
 
     return jsonify({
-        'header': f'Расписание группы "{group}" не найдено',
+        'header': f'Не удалось загрузить расписание для id={group_id}',
         'days': [],
         'debug_server_logs': diagnostic_logs
     })
 
 
-# ─── ОСТАЛЬНЫЕ СЛУЖЕБНЫЕ ЭНДПОИНТЫ ───────────────────────────────────────────
 @app.route('/api/schedule/by_id', methods=['POST','OPTIONS'])
 def schedule_by_id():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -424,8 +357,7 @@ def schedule_by_id():
     week       = str(data.get('week','0'))
     if not group_id: return jsonify({'error': 'Не указан group_id'})
 
-    s = edu_session()
-    result = call_schedule_by_id(s, group_id, week, group_name)
+    result = call_schedule_by_id(group_id, week, group_name)
 
     if result and result['success']:
         return jsonify({'header': result['header'], 'days': result['days']})
