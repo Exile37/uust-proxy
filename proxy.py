@@ -159,47 +159,71 @@ def logout():
     session.clear()
     return jsonify({'success': True})
 
-# =========================
-# РАСПИСАНИЕ
-# =========================
+# ==========================================
+# РАСПИСАНИЕ (ОБНОВЛЕНО ПОД НОВЫЙ ПОИСК ВУЗА)
+# ==========================================
 
 @app.route('/api/schedule/groups', methods=['GET', 'OPTIONS'])
 def schedule_groups():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-    faculty = request.args.get('faculty', '26')
+        
+    # Принимаем поисковый запрос от мобильного приложения. 
+    # По умолчанию передаем символ 'И' или 'Б' (чтобы при первом открытии загрузить хоть какие-то группы)
+    search_query = request.args.get('query', 'И')
+    
     try:
-        r = requests.get(
-            f'{EDU_URL}/getList.php?faculty={faculty}',
-            headers=EDU_HEADERS, timeout=15
+        # Новый скрипт поиска групп на сайте вуза
+        search_url = f'{EDU_URL}/getGroupList.php'
+        payload = {'query': search_query}
+        
+        # Сайт принимает POST-запрос с текстом поиска
+        r = requests.post(
+            search_url,
+            data=payload,
+            headers=EDU_HEADERS,
+            timeout=15
         )
         
-        # Надежный парсинг через BeautifulSoup взамен регулярных выражений
-        soup = BeautifulSoup(r.text, 'html.parser')
         groups = []
         
-        for link in soup.find_all('a'):
-            group_name = link.get_text(strip=True)
-            if not group_name:
-                continue
-                
-            # Вариант 1: Ищем скрытый div с display:none, в котором лежит ID группы
-            prev_div = link.find_previous('div', style=lambda s: s and 'display' in s and 'none' in s)
+        # Сценарий 1: Если вуз возвращает чистый JSON
+        try:
+            data = r.json()
+            if isinstance(data, list):
+                for item in data:
+                    g_id = item.get('id', item.get('value', ''))
+                    g_name = item.get('name', item.get('label', ''))
+                    if g_name:
+                        groups.append({'id': str(g_id), 'name': g_name.strip()})
+            elif isinstance(data, dict) and 'suggestions' in data:
+                for item in data['suggestions']:
+                    groups.append({
+                        'id': str(item.get('data', '')),
+                        'name': item.get('value', '').strip()
+                    })
+        except ValueError:
+            # Сценарий 2: Если вуз возвращает HTML-кусок (список li / option / a)
+            soup = BeautifulSoup(r.text, 'html.parser')
             
-            if prev_div and prev_div.get_text(strip=True).isdigit():
-                group_id = prev_div.get_text(strip=True)
-                groups.append({'id': group_id, 'name': group_name})
-            else:
-                # Вариант 2 (Запасной): Если вуз перенес ID прямо в ссылку (например, getShedule.php?id=123)
-                href = link.get('href', '')
-                id_match = re.search(r'id=(\d+)', href)
-                if id_match:
-                    groups.append({'id': id_match.group(1), 'name': group_name})
+            for el in soup.find_all(['li', 'option']):
+                group_name = el.get_text(strip=True)
+                group_id = el.get('data-id') or el.get('value')
+                if group_name and group_id:
+                    groups.append({'id': str(group_id), 'name': group_name})
+                    
+            if not groups:
+                for link in soup.find_all('a'):
+                    group_name = link.get_text(strip=True)
+                    href = link.get('href', '')
+                    id_match = re.search(r'id=(\d+)', href)
+                    if group_name and id_match:
+                        groups.append({'id': id_match.group(1), 'name': group_name})
 
-        # Если после парсинга массив пуст, выводим в логи кусок ответа от сервера вуза
+        # Если массив пуст — логируем ответ в панель Render
         if not groups:
-            print(f"[DEBUG] Группы для факультета {faculty} не найдены. Ответ сервера вуза (первые 600 символов):")
-            print(r.text[:600])
+            print(f"[DEBUG] Не удалось найти группы по запросу '{search_query}'.")
+            print("Ответ сервера вуза (первые 500 символов):", r.text[:500])
 
         return jsonify({'groups': groups})
     except Exception as e:
@@ -291,5 +315,4 @@ def schedule_timetable():
         return jsonify({'error': str(e)})
 
 if __name__ == '__main__':
-    # Локальный запуск (Render использует gunicorn/uwsgi, но это нужно для тестов)
     app.run(host='0.0.0.0', port=5000)
