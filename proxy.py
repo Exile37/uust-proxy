@@ -445,7 +445,7 @@ def debug_find_group():
                 results[f'{ep}(id={gid})'] = {'error': str(e)}
 
     for ep in ['getGroups.php','getData.php','getFaculties.php']:
-        for payload in [{}, {'Ыtype':'groups'}, {'type':'group'}]:
+        for payload in [{}, {'type':'groups'}, {'type':'group'}]:
             try:
                 r = s.post(f'{PHP_URL}/{ep}', data=payload, timeout=4)
                 if r.status_code == 200:
@@ -459,4 +459,4 @@ def debug_find_group():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)Ы
+    app.run(host='0.0.0.0', port=5000, debug=True)
