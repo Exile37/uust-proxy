@@ -36,8 +36,7 @@ def ping():
     s.headers.update(HEADERS)
     debug_info = {}
     try:
-        # Проверяем, как Render видит главную страницу расписания вуза
-        r = s.get(EDU_URL + '/', timeout=5)
+        r = s.get(f'{EDU_URL}/index.php', timeout=5)
         debug_info['status_code'] = r.status_code
         debug_info['received_cookies'] = requests.utils.dict_from_cookiejar(s.cookies)
         debug_info['html_preview'] = r.text[:400].replace('\n', ' ').strip()
@@ -52,12 +51,22 @@ def ping():
 def edu_session():
     s = requests.Session()
     s.headers.update(HEADERS)
+    
+    # Если студент уже авторизован в ЛК, берем его куки
+    if 'cookies' in session:
+        s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
+        print(f'[SESSION_INIT] Используем куки авторизованного пользователя.')
+        return s
+        
     try:
-        # Делаем обязательный GET для инициализации сессии и кук PHPSESSID
-        r = s.get(EDU_URL + '/', timeout=5)
-        print(f'[SESSION_INIT] Инициализация сессии. Статус: {r.status_code}, Куки: {requests.utils.dict_from_cookiejar(s.cookies)}')
+        # Пробуем выбить куку PHPSESSID через index.php или страницу расписания
+        r = s.get(f'{EDU_URL}/index.php', timeout=5)
+        if not s.cookies:
+            s.get(f'{EDU_URL}/?page=rasp', timeout=5)
+            
+        print(f'[SESSION_INIT] Холодный запуск. Статус: {r.status_code}, Куки: {requests.utils.dict_from_cookiejar(s.cookies)}')
     except Exception as e:
-        print(f'[SESSION_INIT] Ошибка подключения к главной СФ УУНиТ: {e}')
+        print(f'[SESSION_INIT] Ошибка инициализации: {e}')
     return s
 
 # ─── AUTH (ЛИЧНЫЙ КАБИНЕТ) ───────────────────────────────────────────────────
@@ -185,7 +194,6 @@ def find_group_id(s: requests.Session, group_name: str) -> tuple[str|None, str|N
                 logs['attempts'].append({'url': f'{php}', 'error': str(e)})
                 continue
 
-    # Перебор по факультетам (если первые запросы не упали по RuntimeError)
     for fid in range(1, 16):
         for php in ['getGroups.php', 'getData.php']:
             for payload in [{'faculty': str(fid)}, {'faculty_id': str(fid)}, {'id': str(fid), 'type': 'groups'}]:
@@ -205,7 +213,6 @@ def find_group_id(s: requests.Session, group_name: str) -> tuple[str|None, str|N
 
 
 def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
-    """Пытается достать ID группы из JSON или HTML ответа."""
     try:
         import json
         data = json.loads(text)
@@ -350,7 +357,7 @@ def call_schedule_by_id(s: requests.Session, group_id: str, week: str, group_nam
     return None
 
 
-# ─── ГЛАВНЫЙ ЭНДПОИНТ (С ВЫВОДОМ ДЕБАГ-ЛОГА НА ФРОНТЕНД ПРИ ОШИБКЕ) ───────────
+# ─── ГЛАВНЫЙ ЭНДПОИНТ (С АВАРИЙНЫМ ОБХОДОМ БЕЗ КУК) ───────────────────────────
 @app.route('/api/schedule/by_name', methods=['POST','OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -363,22 +370,29 @@ def schedule_by_name():
     diagnostic_logs = {}
 
     try:
-        # Ищем ID группы и собираем логи ответов вуза
         group_id, _, diagnostic_logs = find_group_id(s, group)
     except RuntimeError as db_error:
-        # Если словили 'Cannot select db!', отдаем логи прямо фронтенду для анализа
-        return jsonify({
-            'header': 'Ошибка сессии или блокировка хостинга',
-            'days': [{
-                'name': 'Диагностика', 'header': '',
-                'lessons': [{
-                    'num': '!', 'time': '--:--',
-                    'subject': 'Сайт вуза вернул ошибку БД для облачного сервера.',
-                    'teacher': str(db_error), 'room': 'RENDER'
-                }]
-            }],
-            'debug_server_logs': diagnostic_logs
-        })
+        print("[SCHEDULE] Сессия упала с 'Cannot select db!', пробуем аварийный пустой запрос...")
+        try:
+            # Трюк: Если бэк вуза багается на пустые сессии, пробуем совсем чистый сессионный поток
+            clean_session = requests.Session()
+            clean_session.headers.update(HEADERS)
+            group_id, _, backup_logs = find_group_id(clean_session, group)
+            s = clean_session
+            diagnostic_logs = backup_logs
+        except Exception:
+            return jsonify({
+                'header': 'Ошибка сессии СФ УУНиТ',
+                'days': [{
+                    'name': 'Диагностика', 'header': '',
+                    'lessons': [{
+                        'num': '!', 'time': '--:--',
+                        'subject': 'Сервер вуза сбросил сессию (Cannot select db).',
+                        'teacher': 'Пожалуйста, сначала зайдите в свой профиль в приложении.', 'room': 'APP'
+                    }]
+                }],
+                'debug_server_logs': diagnostic_logs
+            })
 
     if not group_id:
         return jsonify({
