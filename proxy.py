@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import itertools
+import re
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_123'
@@ -33,7 +33,7 @@ def ping():
 def login():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-    data = request.json
+    data = request.json or {}
     username = data.get('username')
     password = data.get('password')
     s = requests.Session()
@@ -155,30 +155,16 @@ def logout():
     return jsonify({'success': True})
 
 
-# =======================================================
-#УЛЬТИМАТИВНЫЙ ПОДБОРЩИК И ПАРСЕР ОФИЦИАЛЬНОГО API ВУЗА
-# =======================================================
+# ========================================================
+# СВЕРХУСТОЙЧИВЫЙ ПОИСК И ИНТЕГРАЦИЯ С ОФИЦИАЛЬНЫМ API
+# ========================================================
 
-def generate_layout_variants(text):
-    """Генерирует варианты текста с заменой К/K и М/M (рус/лат)"""
-    replacements = {
-        'К': ['К', 'K'],
-        'K': ['К', 'K'],
-        'М': ['М', 'M'],
-        'M': ['М', 'M']
-    }
-    
-    # Разбиваем строку на символы и ищем варианты замен
-    options = []
-    for char in text:
-        if char in replacements:
-            options.append(replacements[char])
-        else:
-            options.append([char])
-            
-    # Собираем все уникальные комбинации строк
-    variants = [''.join(items) for items in itertools.product(*options)]
-    return list(set(variants))
+def clean_string(text):
+    """Удаляет спецсимволы, дефисы, скобки и нормализует раскладку букв"""
+    t = text.upper().replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+    # Переводим латиницу в кириллицу для поиска
+    t = t.replace('K', 'К').replace('M', 'М').replace('A', 'А').replace('B', 'В')
+    return t
 
 @app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule_by_name():
@@ -193,41 +179,59 @@ def schedule_by_name():
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Генерируем возможные написания (с дефисом и без, в разных раскладках)
-        search_queries = []
-        variants = generate_layout_variants(raw_group_name.upper())
-        for v in variants:
-            search_queries.append(v)
-            # Если ввели без дефиса (например 4М21), попробуем также вариант К-4М21
-            if not v.startswith('К-') and not v.startswith('K-'):
-                search_queries.append(f"К-{v}")
-                search_queries.append(f"K-{v}")
-
-        search_res = None
-        chosen_query = None
+        # 1. Выделяем корневую поисковую фразу (например, из К-4М21 или 4М21 получаем 4М21)
+        match = re.search(r'\d[А-ЯA-Z]\d+', raw_group_name.upper())
+        core_query = match.group(0) if match else raw_group_name
         
-        # Перебираем варианты, пока API вуза не выдаст нам id группы
-        for q in search_queries:
-            print(f"[SCHEDULE_SEARCH] Пробуем запрос к API: {q}")
+        # Если в запросе есть "М", подстрахуемся и проверим оба варианта (рус/лат)
+        queries_to_try = [core_query]
+        if 'М' in core_query:
+            queries_to_try.append(core_query.replace('М', 'M'))
+        elif 'M' in core_query:
+            queries_to_try.append(core_query.replace('M', 'М'))
+
+        groups_list = []
+        # Пробуем получить список групп по корневому значению
+        for q in queries_to_try:
+            print(f"[SCHEDULE] Попытка найти базу групп через корень: {q}")
             url = f'{EDU_URL}/api/search?query={q}'
             try:
-                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).json()
+                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8).json()
                 if res and res.get('groups'):
-                    search_res = res
-                    chosen_query = q
-                    print(f"[SCHEDULE_SEARCH] Найдено совпадение для: {chosen_query}!")
+                    groups_list = res.get('groups', [])
                     break
             except Exception:
                 continue
 
-        if not search_res or not search_res.get('groups'):
-            print(f"[SCHEDULE_SEARCH] Группа {raw_group_name} не найдена ни в одной раскладке")
+        # 2. Фильтруем массив групп «умным» посимвольным сопоставлением
+        group_id = None
+        real_group_title = None
+        normalized_target = clean_string(raw_group_name)
+
+        print(f"[SCHEDULE] Нормализованная цель для поиска: {normalized_target}")
+
+        for group in groups_list:
+            title = group.get('title', '')
+            normalized_title = clean_string(title)
+            
+            # Если наша цель (4М21) есть внутри системного имени (К-4М21-22) или наоборот
+            if normalized_target in normalized_title or normalized_title in normalized_target:
+                group_id = group.get('id')
+                real_group_title = title
+                print(f"[SCHEDULE] Успех! Найдено соответствие: {real_group_title} (ID: {group_id})")
+                break
+
+        # Если прямого совпадения нет, берем просто самую первую похожую группу из выдачи
+        if not group_id and groups_list:
+            group_id = groups_list[0].get('id')
+            real_group_title = groups_list[0].get('title')
+            print(f"[SCHEDULE] Точного совпадения нет. Взята первая похожая группа: {real_group_title}")
+
+        if not group_id:
+            print(f"[SCHEDULE] Группа {raw_group_name} абсолютно не найдена в системе вуза")
             return jsonify({'header': f'Группа "{raw_group_name}" не найдена', 'days': []})
             
-        group_id = search_res['groups'][0]['id']
-        real_group_title = search_res['groups'][0]['title']
-        
-        # Шаг 2. Запрашиваем чистое JSON-расписание по полученному ID
+        # 3. Запрашиваем готовый JSON расписания напрямую из базы данных СФ УУНиТ по ID
         schedule_url = f'{EDU_URL}/api/schedule?id={group_id}&week={week}'
         api_data = requests.get(schedule_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
         
@@ -241,7 +245,7 @@ def schedule_by_name():
         
         days_dict = {i: {'name': name, 'header': '', 'lessons': []} for i, name in day_names.items()}
         
-        # Разбираем пары из JSON
+        # Наполняем структуру расписания элементами из JSON ответа вуза
         for lesson in api_data.get('lessons', []):
             d_num = lesson.get('day')
             if d_num in days_dict:
@@ -265,6 +269,7 @@ def schedule_by_name():
                     'room': room_info
                 })
                 
+        # Сортируем пары по возрастанию номеров (1, 2, 3...)
         for d in days_dict.values():
             d['lessons'].sort(key=lambda x: x['num'])
             
