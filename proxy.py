@@ -120,7 +120,7 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── ТОЧНЫЙ ПОИСК ЧЕРЕЗ getList.php ──────────────────────────────────────────
+# ─── ОТЛАДОЧНЫЙ ПОИСК ID ГРУППЫ ──────────────────────────────────────────────
 def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
     clean_name = name_lower.replace('к-', '').strip()
@@ -129,13 +129,18 @@ def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     s = requests.Session()
     s.headers.update(HEADERS)
 
-    # Приоритетно проверяем факультет 26 со скриншота, затем остальные возможные (1-40)
+    # Принудительно проверяем факультет 26, затем остальные (1-40)
     faculty_ids = [26] + [i for i in range(1, 41) if i != 26]
 
     for fid in faculty_ids:
         try:
-            # Делаем GET-запрос к getList.php, как показал твой инспектор сети
-            r = s.get(f'{PHP_URL}/getList.php', params={'faculty': str(fid)}, timeout=1.5)
+            r = s.get(f'{PHP_URL}/getList.php', params={'faculty': str(fid)}, timeout=3)
+            
+            # ОТЛАДКА: выводим ответ от сервера в логи Render
+            if fid == 26:
+                print("======== [DEBUG] ОТВЕТ ОТ GETLIST (FACULTY 26) ========")
+                print(r.text[:1000])
+                print("=======================================================")
             
             if r.status_code == 200 and "cannot select db" not in r.text.lower():
                 gid = extract_group_id_from_response(r.text, name_lower)
@@ -143,7 +148,7 @@ def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
                     gid = extract_group_id_from_response(r.text, clean_name)
                     
                 if gid:
-                    print(f'[FIND_ID] Группа найдена на факультете {fid} через getList! ID: {gid}')
+                    print(f'[FIND_ID] Найдено на факультете {fid}! ID: {gid}')
                     return gid, group_name, logs
         except Exception as e:
             continue
@@ -171,7 +176,6 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
 
     try:
         soup = BeautifulSoup(text, 'html.parser')
-        # Ищем совпадения в тегах option (в выпадающих списках)
         for opt in soup.find_all(['option', 'li', 'a']):
             opt_text = opt.get_text(strip=True).lower()
             if name_lower in opt_text:
@@ -269,9 +273,8 @@ def parse_schedule_html(html: str, group: str) -> dict:
 
 
 def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
-    # Используем getShedule.php со скриншота
     payload = {'id': group_id, 'week': week}
-    endpoints = ['getShedule.php', 'getSheduleBody.php']
+    endpoints = ['getShedule.php', 'getSheduleBody.php', 'getScheduleBody.php']
     
     for ep in endpoints:
         try:
