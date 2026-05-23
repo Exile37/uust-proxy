@@ -312,7 +312,7 @@ def schedule_by_name():
                 'type': '2'  # Поиск по группе
             }
             
-            r = requests.post(f'{EDU_URL}/index.php', data=form_payload, headers=EDU_HEADERS, timeout=12)
+            r = requests.post(f'{EDU_URL}/index.php', data=form_payload, headers=EDU_POST_HEADERS, timeout=12)
             
             header, days, success = parse_html_schedule_direct(r.text, g_variant)
             
