@@ -45,7 +45,10 @@ def add_cors(response):
 @app.route("/ping")
 def ping():
     return jsonify({"status": "ok"})
-
+    
+@app.route("/")
+def health():
+    return jsonify({"status": "ok", "service": "uust-proxy"})
 
 @app.route("/api/login", methods=["POST", "OPTIONS"])
 def login():
