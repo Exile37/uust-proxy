@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import re
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_123'
@@ -16,13 +15,6 @@ HEADERS = {
         'AppleWebKit/537.36 (KHTML, like Gecko) '
         'Chrome/124.0 Safari/537.36'
     )
-}
-
-EDU_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Referer': f'{EDU_URL}/',
-    'Origin': EDU_URL,
-    'Content-Type': 'application/x-www-form-urlencoded'
 }
 
 @app.after_request
@@ -163,101 +155,9 @@ def logout():
 
 
 # ==========================================
-# ПАРСЕР HTML ТАБЛИЦЫ РАСПИСАНИЯ СФ УУНиТ
+# ЧИСТЫЙ РАБОЧИЙ ЭНДПОИНТ ЧЕРЕЗ ОФИЦИАЛЬНОЕ API ВУЗА
 # ==========================================
 
-def parse_schedule_html(html_text, group_name):
-    soup = BeautifulSoup(html_text, 'html.parser')
-    
-    header_text = f"Группа {group_name}"
-    rasp_head = soup.find(class_='rasp_head')
-    if rasp_head:
-        header_text = rasp_head.get_text(separator=' ', strip=True)
-        
-    days = [
-        {'name': 'Понедельник', 'lessons': []},
-        {'name': 'Вторник', 'lessons': []},
-        {'name': 'Среда', 'lessons': []},
-        {'name': 'Четверг', 'lessons': []},
-        {'name': 'Пятница', 'lessons': []},
-        {'name': 'Суббота', 'lessons': []},
-    ]
-    
-    table = soup.find('table')
-    if not table:
-        return header_text, days, False
-        
-    rows = table.find_all('tr')
-    if not rows:
-        return header_text, days, False
-
-    # Собираем даты из первой строки th
-    headers = rows[0].find_all(['th', 'td'])
-    for i, th in enumerate(headers):
-        if i < len(days):
-            days[i]['header'] = th.get_text(strip=True)
-
-    has_data = False
-    for row in rows[1:]:
-        cells = row.find_all('td')
-        for i, cell in enumerate(cells):
-            if i >= len(days):
-                break
-            
-            lines = [line.strip() for line in cell.get_text(separator='\n').split('\n') if line.strip()]
-            if not lines:
-                continue
-
-            num = ""
-            time_str = ""
-            subject = ""
-            teacher = ""
-            room = ""
-
-            clean_lines = []
-            for line in lines:
-                if re.search(r'\d{2}:\d{2}', line):
-                    time_str = line
-                elif re.match(r'^\d+\s*\.$', line) or (line.isdigit() and len(line) == 1):
-                    num = line.replace('.', '').strip()
-                else:
-                    clean_lines.append(line)
-
-            if not clean_lines:
-                continue
-
-            final_lines = []
-            for line in clean_lines:
-                if any(x in line.lower() for x in ['пр', 'каб', 'ауд', 'лр', 'лек', 'лаб']):
-                    room = line
-                else:
-                    final_lines.append(line)
-
-            if final_lines:
-                has_data = True
-                bold_tag = cell.find(['b', 'strong'])
-                if bold_tag:
-                    subject = bold_tag.get_text(strip=True)
-                    t_parts = [l for l in final_lines if l.lower() != subject.lower()]
-                    if t_parts:
-                        teacher = " ".join(t_parts)
-                else:
-                    subject = final_lines[0]
-                    if len(final_lines) > 1:
-                        teacher = " ".join(final_lines[1:])
-
-            if subject or time_str:
-                days[i]['lessons'].append({
-                    'num': num if num else str(len(days[i]['lessons']) + 1),
-                    'time': time_str if time_str else "—",
-                    'subject': subject if subject else "Занятие",
-                    'teacher': teacher if teacher else "",
-                    'room': room if room else "",
-                })
-
-    return header_text, days, has_data
-
-# МЕНЯЕМ МЕТОД ЭНДПОИНТА НА POST ДЛЯ ПРИЕМА JSON ИЗ ПРИЛОЖЕНИЯ
 @app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS':
@@ -271,35 +171,82 @@ def schedule_by_name():
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Отправляем форму POST-запросом на сайт вуза
-        payload = {
-            'group_name': group_name,
-            'week': week,
-            'type': '2'
+        # Шаг 1. Получаем ID группы через внутренний поиск API
+        search_url = f'{EDU_URL}/api/search?query={group_name}'
+        search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+        
+        # Если по исходному имени ничего нет, пробуем заменить раскладку К/K
+        if not search_res or not search_res.get('groups'):
+            alt_name = group_name.replace('К', 'K') if 'К' in group_name else group_name.replace('K', 'К')
+            search_url = f'{EDU_URL}/api/search?query={alt_name}'
+            search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+
+        if not search_res or not search_res.get('groups'):
+            return jsonify({'header': f'Группа "{group_name}" не найдена', 'days': []})
+            
+        # Берем ID первой совпавшей группы
+        group_id = search_res['groups'][0]['id']
+        real_group_title = search_res['groups'][0]['title']
+        
+        # Шаг 2. Запрашиваем чистое JSON-расписание по этому ID
+        schedule_url = f'{EDU_URL}/api/schedule?id={group_id}&week={week}'
+        api_data = requests.get(schedule_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+        
+        # Шаг 3. Преобразуем формат API вуза в формат нашего мобильного приложения
+        # API возвращает 'week_range' (например "25.05.2026 - 31.05.2026")
+        week_range = api_data.get('week_range', '')
+        header_text = f"Группа {real_group_title} ({week_range})" if week_range else f"Группа {real_group_title}"
+        
+        # Массив соответствия индексов дней недели (сервер присылает 1=Понедельник, 2=Вторник...)
+        day_names = {
+            1: 'Понедельник',
+            2: 'Вторник',
+            3: 'Среда',
+            4: 'Четверг',
+            5: 'Пятница',
+            6: 'Суббота'
         }
         
-        r = requests.post(f'{EDU_URL}/index.php', data=payload, headers=EDU_HEADERS, timeout=15)
-        header, days, success = parse_schedule_html(r.text, group_name)
+        days_dict = {i: {'name': name, 'header': '', 'lessons': []} for i, name in day_names.items()}
         
-        # Если пусто — пробуем поменять раскладку буквы К (Русская/Английская)
-        if not success:
-            alt_name = group_name
-            if 'К' in group_name:
-                alt_name = group_name.replace('К', 'K')
-            elif 'K' in group_name:
-                alt_name = group_name.replace('K', 'К')
+        # Наполняем пары
+        for lesson in api_data.get('lessons', []):
+            d_num = lesson.get('day') # Число от 1 до 6
+            if d_num in days_dict:
+                # Добавляем дату дня, если она пришла из API
+                if lesson.get('date') and not days_dict[d_num]['header']:
+                    days_dict[d_num]['header'] = lesson.get('date')
+                    
+                # Формируем красивую строку кабинета
+                room_info = lesson.get('room', '')
+                if lesson.get('building'):
+                    room_info += f"-{lesson.get('building')}"
                 
-            if alt_name != group_name:
-                payload['group_name'] = alt_name
-                r2 = requests.post(f'{EDU_URL}/index.php', data=payload, headers=EDU_HEADERS, timeout=15)
-                h2, d2, s2 = parse_schedule_html(r2.text, group_name)
-                if s2:
-                    header, days = h2, d2
+                # Тип занятия (Практика, Лекция и т.д.)
+                l_type = lesson.get('type', '')
+                subject_full = lesson.get('subject', 'Занятие')
+                if l_type:
+                    subject_full += f" ({l_type})"
 
-        return jsonify({'header': header, 'days': days})
+                days_dict[d_num]['lessons'].append({
+                    'num': str(lesson.get('number', '')),
+                    'time': f"{lesson.get('time_start', '')} - {lesson.get('time_end', '')}",
+                    'subject': subject_full,
+                    'teacher': lesson.get('teacher', ''),
+                    'room': room_info
+                })
+                
+        # Сортируем уроки внутри дней по их номеру
+        for d in days_dict.values():
+            d['lessons'].sort(key=lambda x: x['num'])
+            
+        return jsonify({
+            'header': header_text,
+            'days': list(days_dict.values())
+        })
         
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({'error': f'Ошибка API вуза: {str(e)}'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
