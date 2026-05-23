@@ -4,7 +4,6 @@ from bs4 import BeautifulSoup
 import re
 
 app = Flask(__name__)
-# Установим стабильный секретный ключ
 app.secret_key = 'stable_key_for_session_persistence'
 
 BASE_URL = 'https://account.str.uust.ru'
@@ -34,13 +33,10 @@ def login():
         soup = BeautifulSoup(r.text, 'html.parser')
         form = soup.find('form')
         if not form: return jsonify({'success': False, 'error': 'Нет формы'})
-        
         payload = {i.get('name'): i.get('value', '') for i in form.find_all('input') if i.get('name')}
-        # Динамический поиск полей логина/пароля
         for k in payload:
             if 'user' in k.lower() or 'email' in k.lower(): payload[k] = data.get('username')
             if 'pass' in k.lower(): payload[k] = data.get('password')
-            
         resp = s.post(f'{BASE_URL}/Account/Login', data=payload, allow_redirects=True, timeout=10)
         if any('.AspNet' in c.name for c in s.cookies) or 'Выйти' in resp.text:
             session['cookies'] = requests.utils.dict_from_cookiejar(s.cookies)
@@ -62,15 +58,12 @@ def subjects():
         for a in soup.find_all('a', href=re.compile(r'/Journals/DisciplineGrades')):
             row = a.find_parent('tr')
             cells = row.find_all('td') if row else []
-            result.append({
-                'name': cells[1].text.strip() if len(cells)>1 else 'Дисциплина',
-                'url': a['href']
-            })
+            result.append({'name': cells[1].text.strip() if len(cells)>1 else 'Дисциплина', 'url': a['href']})
         return jsonify({'subjects': result})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ─── ПОИСК ГРУППЫ И РАСПИСАНИЕ ──────────────────────────────────────────────
+# ─── ПОИСК И РАСПИСАНИЕ ─────────────────────────────────────────────────────
 def extract_id(text, name):
     soup = BeautifulSoup(text, 'html.parser')
     for li in soup.find_all('li'):
@@ -80,15 +73,27 @@ def extract_id(text, name):
             return div.text.strip() if div else None
     return None
 
+def parse_schedule(html, group):
+    soup = BeautifulSoup(html, 'html.parser')
+    days = []
+    for table in soup.find_all('table'):
+        day_info = {'name': (table.find('caption') or table.find('th')).text.strip() if table.find('caption') else "День", 'lessons': []}
+        for row in table.find_all('tr')[1:]:
+            cells = row.find_all('td')
+            if len(cells) >= 2:
+                day_info['lessons'].append({'time': cells[0].text.strip(), 'subject': cells[1].text.strip()})
+        days.append(day_info)
+    return {'header': f'Расписание {group}', 'days': days, 'success': len(days) > 0}
+
 @app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule():
     data = request.json or {}
     group_name = data.get('group_name', '')
+    s = requests.Session()
     
     # 1. Поиск ID
     group_id = None
-    s = requests.Session()
-    for fid in range(1, 40): # Сканируем факультеты
+    for fid in range(1, 40):
         try:
             r = s.get(f'{PHP_URL}/getList.php', params={'faculty': fid}, timeout=1)
             group_id = extract_id(r.text, group_name)
@@ -100,9 +105,9 @@ def schedule():
     # 2. Получение расписания
     try:
         r = s.post(f'{PHP_URL}/getShedule.php', data={'id': group_id, 'week': 0}, timeout=3)
-        return jsonify({'header': f'Расписание {group_name}', 'days': [], 'raw': r.text[:500]})
+        return jsonify(parse_schedule(r.text, group_name))
     except:
-        return jsonify({'header': 'Ошибка сервера', 'days': []})
+        return jsonify({'header': 'Ошибка загрузки расписания', 'days': []})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
