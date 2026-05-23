@@ -121,21 +121,24 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── СВЕРХБЫСТРЫЙ ПОИСК ID ГРУППЫ (БЕЗ ПЕРЕБОРОВ И ТАЙМАУТОВ) ─────────────────
+# ─── СВЕРХБЫСТРЫЙ И НАДЕЖНЫЙ ПОИСК ID ГРУППЫ ──────────────────────────────────
 def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
     logs = {'attempts': []}
+    
+    s = requests.Session()
+    s.headers.update(HEADERS)
 
-    # Оставляем только 2 самых критически важных эндпоинта, которые реально отдают группы
+    # Шаг 1: Быстрая проверка общих эндпоинтов
     targets = [
         ('getGroups.php', {'type': 'group'}),
-        ('getData.php',   {'type': 'groups'})
+        ('getData.php',   {'type': 'groups'}),
+        ('search.php',    {'query': group_name})
     ]
 
     for php, payload in targets:
         try:
-            # Ужимаем timeout до 4 секунд, чтобы сервер не уходил в ступор
-            r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=4)
+            r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=2)
             preview = r.text[:100].strip()
             logs['attempts'].append({'url': php, 'status': r.status_code, 'preview': preview})
             
@@ -145,6 +148,18 @@ def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
                     return gid, group_name, logs
         except Exception as e:
             logs['attempts'].append({'url': php, 'error': str(e)})
+
+    # Шаг 2: Пробиваем по ID факультетов через одну сессию (очень быстро)
+    for fid in range(1, 16):
+        try:
+            r = s.post(f'{PHP_URL}/getData.php', data={'id': str(fid), 'type': 'groups'}, timeout=1.5)
+            if r.status_code == 200 and "cannot select db" not in r.text.lower():
+                gid = extract_group_id_from_response(r.text, name_lower)
+                if gid:
+                    print(f'[FIND_ID] Найдено через факультет {fid}')
+                    logs['attempts'].append({'url': f'getData.php?faculty={fid}', 'status': 200, 'found': True})
+                    return gid, group_name, logs
+        except Exception:
             continue
 
     return None, None, logs
@@ -161,6 +176,10 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
                     item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower()
                     if name_lower in item_name or item_name in name_lower:
                         return str(item.get('id') or item.get('group_id') or item.get('ID',''))
+        elif isinstance(items, dict):
+            for key, val in items.items():
+                if name_lower in str(val).lower():
+                    return str(key)
     except Exception:
         pass
 
@@ -264,7 +283,6 @@ def parse_schedule_html(html: str, group: str) -> dict:
 
 def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
     payload = {'id': group_id, 'week': week}
-    # Оставляем только главный скрипт тела расписания
     body_endpoints = ['getSheduleBody.php', 'getShedule.php', 'getScheduleBody.php']
     
     for ep in body_endpoints:
@@ -287,7 +305,7 @@ def schedule_by_name():
     week  = str(data.get('week','0'))
     if not group: return jsonify({'error': 'Не указана группа'})
 
-    # Быстрый поиск ID группы
+    # Ищем ID группы
     group_id, _, diagnostic_logs = find_group_id(group)
 
     if not group_id:
