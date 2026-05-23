@@ -10,12 +10,18 @@ app.secret_key = 'super_secret_key_123'
 BASE_URL = 'https://account.str.uust.ru'
 EDU_URL = 'https://edu.str.uust.ru'
 
+# Имитируем реальный браузер на полную мощность
 HEADERS = {
-    'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/124.0 Safari/537.36'
-    )
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+}
+
+EDU_POST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Origin': EDU_URL,
+    'Referer': f'{EDU_URL}/index.php',
 }
 
 @app.after_request
@@ -156,15 +162,125 @@ def logout():
 
 
 # ========================================================
-# СВЕРХУСТОЙЧИВЫЙ ПОИСК И ИНТЕГРАЦИЯ С ОФИЦИАЛЬНЫМ API
+#   НОВЫЙ НЕУБИВАЕМЫЙ ПАРСЕР СТРАНИЦЫ РАСПИСАНИЯ (SCRAPER)
 # ========================================================
 
-def clean_string(text):
-    """Удаляет спецсимволы, дефисы, скобки и нормализует раскладку букв"""
-    t = text.upper().replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
-    # Переводим латиницу в кириллицу для поиска
-    t = t.replace('K', 'К').replace('M', 'М').replace('A', 'А').replace('B', 'В')
-    return t
+def parse_html_schedule_direct(html_text, group_name):
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    # Пытаемся вытащить заголовок (неделю)
+    header_text = f"Расписание группы {group_name}"
+    rasp_head = soup.find(class_='rasp_head')
+    if rasp_head:
+        header_text = rasp_head.get_text(separator=' ', strip=True)
+    elif soup.find('h1'):
+        header_text = soup.find('h1').get_text(strip=True)
+
+    days = [
+        {'name': 'Понедельник', 'header': '', 'lessons': []},
+        {'name': 'Вторник', 'header': '', 'lessons': []},
+        {'name': 'Среда', 'header': '', 'lessons': []},
+        {'name': 'Четверг', 'header': '', 'lessons': []},
+        {'name': 'Пятница', 'header': '', 'lessons': []},
+        {'name': 'Суббота', 'header': '', 'lessons': []},
+    ]
+
+    # Если на странице есть таблицы
+    tables = soup.find_all('table')
+    if not tables:
+        return header_text, days, False
+
+    has_data = False
+    
+    # Перебираем все таблицы на странице (иногда расписание завернуто в несколько таблиц)
+    for table in tables:
+        rows = table.find_all('tr')
+        if not rows:
+            continue
+            
+        # Попытка вытащить даты дней из первой строки таблицы
+        first_row_cells = rows[0].find_all(['th', 'td'])
+        for idx, cell in enumerate(first_row_cells):
+            if idx < len(days):
+                txt = cell.get_text(strip=True)
+                if any(d in txt for d in ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Понедельник']):
+                    days[idx]['header'] = txt
+
+        # Парсим строки с парами
+        for row in rows[1:]:
+            cells = row.find_all('td')
+            if not cells:
+                continue
+                
+            for idx, cell in enumerate(cells):
+                if idx >= len(days):
+                    break
+                
+                # Дробим содержимое ячейки на отдельные текстовые строки
+                lines = [l.strip() for l in cell.get_text(separator='\n').split('\n') if l.strip()]
+                if not lines:
+                    continue
+
+                # Проверяем, нет ли здесь заглушки типа "отсутствует"
+                cell_text_lower = cell.get_text().lower()
+                if 'отсутствует' in cell_text_lower or 'пар нет' in cell_text_lower:
+                    continue
+
+                num = ""
+                time_str = ""
+                subject = ""
+                teacher = ""
+                room = ""
+
+                # Извлекаем время и номер пары
+                clean_lines = []
+                for line in lines:
+                    if re.search(r'\d{2}[:\.]\d{2}', line):
+                        time_str = line
+                    elif re.match(r'^\d+\s*\.$', line) or (line.isdigit() and len(line) == 1):
+                        num = line.replace('.', '').strip()
+                    else:
+                        clean_lines.append(line)
+
+                if not clean_lines:
+                    continue
+
+                # Извлекаем кабинет/аудиторию
+                final_lines = []
+                for line in clean_lines:
+                    if any(x in line.lower() for x in ['каб', 'ауд', 'гк', 'лк', 'пр', 'лаб', 'стадион']):
+                        room = line
+                    else:
+                        final_lines.append(line)
+
+                # Выделяем предмет и преподавателя
+                if final_lines:
+                    has_data = True
+                    bold_item = cell.find(['b', 'strong'])
+                    if bold_item:
+                        subject = bold_item.get_text(strip=True)
+                        teachers_list = [l for l in final_lines if l.lower() != subject.lower()]
+                        teacher = ", ".join(teachers_list) if teachers_list else ""
+                    else:
+                        subject = final_lines[0]
+                        if len(final_lines) > 1:
+                            teacher = ", ".join(final_lines[1:])
+
+                if subject or time_str:
+                    days[idx]['lessons'].append({
+                        'num': num if num else str(len(days[idx]['lessons']) + 1),
+                        'time': time_str if time_str else "08:30 - 10:00",
+                        'subject': subject,
+                        'teacher': teacher,
+                        'room': room
+                    })
+
+    # Сортируем пары внутри дней
+    for d in days:
+        d['lessons'].sort(key=lambda x: x['num'])
+
+    return header_text, days, has_data
+
 
 @app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule_by_name():
@@ -172,114 +288,46 @@ def schedule_by_name():
         return jsonify({}), 200
         
     data = request.json or {}
-    raw_group_name = data.get('group_name', '').strip()
+    group_name = data.get('group_name', '').strip()
     week = str(data.get('week', '0'))
     
-    if not raw_group_name:
+    if not group_name:
         return jsonify({'error': 'Не указано имя группы'})
         
-    try:
-        # 1. Выделяем корневую поисковую фразу (например, из К-4М21 или 4М21 получаем 4М21)
-        match = re.search(r'\d[А-ЯA-Z]\d+', raw_group_name.upper())
-        core_query = match.group(0) if match else raw_group_name
+    # Формируем список вариантов написания группы
+    variants = [group_name]
+    if not group_name.upper().startswith('К-'):
+        variants.append(f"К-{group_name}")
+    if 'М' in group_name.upper():
+        variants.append(group_name.upper().replace('М', 'M')) # латинская М
         
-        # Если в запросе есть "М", подстрахуемся и проверим оба варианта (рус/лат)
-        queries_to_try = [core_query]
-        if 'М' in core_query:
-            queries_to_try.append(core_query.replace('М', 'M'))
-        elif 'M' in core_query:
-            queries_to_try.append(core_query.replace('M', 'М'))
-
-        groups_list = []
-        # Пробуем получить список групп по корневому значению
-        for q in queries_to_try:
-            print(f"[SCHEDULE] Попытка найти базу групп через корень: {q}")
-            url = f'{EDU_URL}/api/search?query={q}'
-            try:
-                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8).json()
-                if res and res.get('groups'):
-                    groups_list = res.get('groups', [])
-                    break
-            except Exception:
-                continue
-
-        # 2. Фильтруем массив групп «умным» посимвольным сопоставлением
-        group_id = None
-        real_group_title = None
-        normalized_target = clean_string(raw_group_name)
-
-        print(f"[SCHEDULE] Нормализованная цель для поиска: {normalized_target}")
-
-        for group in groups_list:
-            title = group.get('title', '')
-            normalized_title = clean_string(title)
+    for g_variant in variants:
+        try:
+            print(f"[HTML_SCRAPE] Пробуем прямую отправку формы для группы: {g_variant}")
             
-            # Если наша цель (4М21) есть внутри системного имени (К-4М21-22) или наоборот
-            if normalized_target in normalized_title or normalized_title in normalized_target:
-                group_id = group.get('id')
-                real_group_title = title
-                print(f"[SCHEDULE] Успех! Найдено соответствие: {real_group_title} (ID: {group_id})")
-                break
-
-        # Если прямого совпадения нет, берем просто самую первую похожую группу из выдачи
-        if not group_id and groups_list:
-            group_id = groups_list[0].get('id')
-            real_group_title = groups_list[0].get('title')
-            print(f"[SCHEDULE] Точного совпадения нет. Взята первая похожая группа: {real_group_title}")
-
-        if not group_id:
-            print(f"[SCHEDULE] Группа {raw_group_name} абсолютно не найдена в системе вуза")
-            return jsonify({'header': f'Группа "{raw_group_name}" не найдена', 'days': []})
+            # Делаем классический POST запроса формы прямо на index.php
+            form_payload = {
+                'group_name': g_variant,
+                'week': week,
+                'type': '2'  # Поиск по группе
+            }
             
-        # 3. Запрашиваем готовый JSON расписания напрямую из базы данных СФ УУНиТ по ID
-        schedule_url = f'{EDU_URL}/api/schedule?id={group_id}&week={week}'
-        api_data = requests.get(schedule_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
-        
-        week_range = api_data.get('week_range', '')
-        header_text = f"Группа {real_group_title} ({week_range})" if week_range else f"Группа {real_group_title}"
-        
-        day_names = {
-            1: 'Понедельник', 2: 'Вторник', 3: 'Среда',
-            4: 'Четверг', 5: 'Пятница', 6: 'Суббота'
-        }
-        
-        days_dict = {i: {'name': name, 'header': '', 'lessons': []} for i, name in day_names.items()}
-        
-        # Наполняем структуру расписания элементами из JSON ответа вуза
-        for lesson in api_data.get('lessons', []):
-            d_num = lesson.get('day')
-            if d_num in days_dict:
-                if lesson.get('date') and not days_dict[d_num]['header']:
-                    days_dict[d_num]['header'] = lesson.get('date')
-                    
-                room_info = lesson.get('room', '')
-                if lesson.get('building'):
-                    room_info += f"-{lesson.get('building')}"
+            r = requests.post(f'{EDU_URL}/index.php', data=form_payload, headers=EDU_HEADERS, timeout=12)
+            
+            header, days, success = parse_html_schedule_direct(r.text, g_variant)
+            
+            if success:
+                print(f"[HTML_SCRAPE] Успешно спарсили расписание со страницы для {g_variant}!")
+                return jsonify({'header': header, 'days': days})
                 
-                l_type = lesson.get('type', '')
-                subject_full = lesson.get('subject', 'Занятие')
-                if l_type:
-                    subject_full += f" ({l_type})"
-
-                days_dict[d_num]['lessons'].append({
-                    'num': str(lesson.get('number', '')),
-                    'time': f"{lesson.get('time_start', '')} - {lesson.get('time_end', '')}",
-                    'subject': subject_full,
-                    'teacher': lesson.get('teacher', ''),
-                    'room': room_info
-                })
-                
-        # Сортируем пары по возрастанию номеров (1, 2, 3...)
-        for d in days_dict.values():
-            d['lessons'].sort(key=lambda x: x['num'])
+        except Exception as e:
+            print(f"[HTML_SCRAPE] Ошибка при обработке варианта {g_variant}: {str(e)}")
+            continue
             
-        return jsonify({
-            'header': header_text,
-            'days': list(days_dict.values())
-        })
-        
-    except Exception as e:
-        return jsonify({'error': f'Ошибка обработки расписания: {str(e)}'})
+    return jsonify({
+        'header': f'Не удалось найти расписание группы "{group_name}" на сайте',
+        'days': []
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
