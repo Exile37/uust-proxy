@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
@@ -174,14 +173,34 @@ def schedule_groups():
             f'{EDU_URL}/getList.php?faculty={faculty}',
             headers=EDU_HEADERS, timeout=15
         )
-        html = r.text
+        
+        # Надежный парсинг через BeautifulSoup взамен регулярных выражений
+        soup = BeautifulSoup(r.text, 'html.parser')
         groups = []
-        pattern = re.compile(
-            r"<div[^>]*display:\s*none[^>]*>(\d+)</div>\s*<a[^>]*>([^<]+)</a>",
-            re.IGNORECASE
-        )
-        for m in pattern.finditer(html):
-            groups.append({'id': m.group(1), 'name': m.group(2).strip()})
+        
+        for link in soup.find_all('a'):
+            group_name = link.get_text(strip=True)
+            if not group_name:
+                continue
+                
+            # Вариант 1: Ищем скрытый div с display:none, в котором лежит ID группы
+            prev_div = link.find_previous('div', style=lambda s: s and 'display' in s and 'none' in s)
+            
+            if prev_div and prev_div.get_text(strip=True).isdigit():
+                group_id = prev_div.get_text(strip=True)
+                groups.append({'id': group_id, 'name': group_name})
+            else:
+                # Вариант 2 (Запасной): Если вуз перенес ID прямо в ссылку (например, getShedule.php?id=123)
+                href = link.get('href', '')
+                id_match = re.search(r'id=(\d+)', href)
+                if id_match:
+                    groups.append({'id': id_match.group(1), 'name': group_name})
+
+        # Если после парсинга массив пуст, выводим в логи кусок ответа от сервера вуза
+        if not groups:
+            print(f"[DEBUG] Группы для факультета {faculty} не найдены. Ответ сервера вуза (первые 600 символов):")
+            print(r.text[:600])
+
         return jsonify({'groups': groups})
     except Exception as e:
         return jsonify({'error': str(e)})
@@ -228,14 +247,12 @@ def schedule_timetable():
             return jsonify({'days': days})
         rows = table.find_all('tr')
 
-        # Заголовки дней
         if rows:
             headers = rows[0].find_all('th')
             for i, th in enumerate(headers):
                 if i < len(days):
                     days[i]['header'] = th.get_text(strip=True)
 
-        # Пары
         for row in rows[1:]:
             cells = row.find_all('td')
             for i, cell in enumerate(cells):
@@ -245,24 +262,18 @@ def schedule_timetable():
                 if not text:
                     continue
 
-                # Время
                 time_match = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', cell.decode_contents())
                 time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ''
 
-                # Номер пары
                 num_match = re.match(r'^(\d+)\.', text)
                 num = num_match.group(1) if num_match else ''
 
-                # Аудитория
                 room_match = re.search(r'(?:Пр|пр)\s*([^\s<,\n]+)', cell.decode_contents())
                 room = room_match.group(1) if room_match else ''
 
-                # Предмет (жирный)
                 bold = cell.find('b') or cell.find('strong')
                 subject = bold.get_text(strip=True) if bold else ''
 
-                # Преподаватель
-                lines = [l.strip() for l in text.split('\n') if l.strip()]
                 teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)', text)
                 teacher = teacher_match.group(1) if teacher_match else ''
 
@@ -278,3 +289,7 @@ def schedule_timetable():
         return jsonify({'days': days})
     except Exception as e:
         return jsonify({'error': str(e)})
+
+if __name__ == '__main__':
+    # Локальный запуск (Render использует gunicorn/uwsgi, но это нужно для тестов)
+    app.run(host='0.0.0.0', port=5000)
