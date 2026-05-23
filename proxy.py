@@ -11,7 +11,6 @@ BASE_URL = 'https://account.str.uust.ru'
 EDU_URL  = 'https://edu.str.uust.ru'
 PHP_URL  = f'{EDU_URL}/php'
 
-# Обновленные заголовки, имитирующие чистый запрос из браузера
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -20,9 +19,6 @@ HEADERS = {
     'Referer': EDU_URL + '/',
     'X-Requested-With': 'XMLHttpRequest',
     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin'
 }
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
@@ -46,7 +42,7 @@ def login():
     s.headers.update(HEADERS)
     try:
         login_url = f'{BASE_URL}/Account/Login'
-        r = s.get(login_url, timeout=15)
+        r = s.get(login_url, timeout=10)
         soup = BeautifulSoup(r.text, 'html.parser')
         form = soup.find('form')
         if not form: return jsonify({'success': False, 'error': 'Форма не найдена'})
@@ -58,7 +54,7 @@ def login():
         payload[lf] = data.get('username')
         payload[pf] = data.get('password')
         resp = s.post(login_url, data=payload, headers={**HEADERS,'Referer':login_url},
-                      allow_redirects=True, timeout=15)
+                      allow_redirects=True, timeout=10)
         if any('.AspNet' in c.name for c in s.cookies) or 'Выйти' in resp.text:
             session['cookies'] = requests.utils.dict_from_cookiejar(s.cookies)
             return jsonify({'success': True})
@@ -81,7 +77,7 @@ def subjects():
     s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
     s.headers.update(HEADERS)
     try:
-        soup = BeautifulSoup(s.get(f'{BASE_URL}/Journals/DisciplinesStudent', timeout=15).text, 'html.parser')
+        soup = BeautifulSoup(s.get(f'{BASE_URL}/Journals/DisciplinesStudent', timeout=10).text, 'html.parser')
         result = []
         for link in soup.find_all('a', href=True):
             if '/Journals/DisciplineGrades' not in link['href']: continue
@@ -108,7 +104,7 @@ def grades():
     s.cookies.update(requests.utils.cookiejar_from_dict(session['cookies']))
     s.headers.update(HEADERS)
     try:
-        soup = BeautifulSoup(s.get(urljoin(BASE_URL, url), timeout=15).text, 'html.parser')
+        soup = BeautifulSoup(s.get(urljoin(BASE_URL, url), timeout=10).text, 'html.parser')
         lessons = []
         table = soup.find('table')
         if table:
@@ -125,50 +121,31 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── ЯДРО: ПОИСК ID ГРУППЫ (БЕЗ КУК И СЕССИЙ) ────────────────────────────────
+# ─── СВЕРХБЫСТРЫЙ ПОИСК ID ГРУППЫ (БЕЗ ПЕРЕБОРОВ И ТАЙМАУТОВ) ─────────────────
 def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
     logs = {'attempts': []}
 
-    endpoints_no_faculty = [
-        ('getGroups.php',    [{'type': 'group'}, {'type': '2'}, {}]),
-        ('getGroup.php',     [{}]),
-        ('getData.php',      [{'type': 'groups'}, {'type': 'group'}, {}]),
-        ('search.php',       [{'query': group_name}, {'q': group_name}]),
+    # Оставляем только 2 самых критически важных эндпоинта, которые реально отдают группы
+    targets = [
+        ('getGroups.php', {'type': 'group'}),
+        ('getData.php',   {'type': 'groups'})
     ]
 
-    # Прямые независимые POST-запросы без объекта Session
-    for php, payloads in endpoints_no_faculty:
-        for payload in payloads:
-            try:
-                r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=4)
-                preview = r.text[:150].strip()
-                logs['attempts'].append({'url': f'{php}', 'payload': payload, 'status': r.status_code, 'preview': preview})
-                
-                if "cannot select db" in r.text.lower():
-                    continue # Пропускаем битый эндпоинт, ищем дальше
-                
-                if r.status_code != 200 or len(r.text) < 10: continue
+    for php, payload in targets:
+        try:
+            # Ужимаем timeout до 4 секунд, чтобы сервер не уходил в ступор
+            r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=4)
+            preview = r.text[:100].strip()
+            logs['attempts'].append({'url': php, 'status': r.status_code, 'preview': preview})
+            
+            if r.status_code == 200 and "cannot select db" not in r.text.lower():
                 gid = extract_group_id_from_response(r.text, name_lower)
                 if gid:
                     return gid, group_name, logs
-            except Exception as e:
-                logs['attempts'].append({'url': f'{php}', 'error': str(e)})
-                continue
-
-    # Перебор по ID факультетов
-    for fid in range(1, 16):
-        for php in ['getGroups.php', 'getData.php']:
-            for payload in [{'faculty': str(fid)}, {'faculty_id': str(fid)}, {'id': str(fid), 'type': 'groups'}]:
-                try:
-                    r = requests.post(f'{PHP_URL}/{php}', data=payload, headers=HEADERS, timeout=3)
-                    if "cannot select db" in r.text.lower() or r.status_code != 200: 
-                        continue
-                    gid = extract_group_id_from_response(r.text, name_lower)
-                    if gid:
-                        return gid, group_name, logs
-                except Exception:
-                    continue
+        except Exception as e:
+            logs['attempts'].append({'url': php, 'error': str(e)})
+            continue
 
     return None, None, logs
 
@@ -184,10 +161,6 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
                     item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower()
                     if name_lower in item_name or item_name in name_lower:
                         return str(item.get('id') or item.get('group_id') or item.get('ID',''))
-        elif isinstance(items, dict):
-            for key, val in items.items():
-                if name_lower in str(val).lower():
-                    return str(key)
     except Exception:
         pass
 
@@ -291,32 +264,21 @@ def parse_schedule_html(html: str, group: str) -> dict:
 
 def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
     payload = {'id': group_id, 'week': week}
-    body_endpoints = [
-        'getSheduleBody.php', 'getShedule.php', 'getSchedule.php',
-        'getSheduleData.php', 'getSheduleWeek.php', 'getScheduleBody.php',
-    ]
+    # Оставляем только главный скрипт тела расписания
+    body_endpoints = ['getSheduleBody.php', 'getShedule.php', 'getScheduleBody.php']
+    
     for ep in body_endpoints:
         try:
-            r = requests.post(f'{PHP_URL}/{ep}', data=payload, headers=HEADERS, timeout=5)
-            if "cannot select db" in r.text.lower(): continue
-            if r.status_code == 200 and len(r.text) > 200 and 'not in allowlist' not in r.text:
+            r = requests.post(f'{PHP_URL}/{ep}', data=payload, headers=HEADERS, timeout=4)
+            if r.status_code == 200 and len(r.text) > 200 and "cannot select db" not in r.text.lower():
                 parsed = parse_schedule_html(r.text, group_name)
                 if parsed['success']: return parsed
         except Exception:
             continue
-
-    try:
-        r = requests.post(f'{PHP_URL}/getSheduleHeader.php', data=payload, headers=HEADERS, timeout=5)
-        if r.status_code == 200 and len(r.text) > 50 and "cannot select db" not in r.text.lower():
-            parsed = parse_schedule_html(r.text, group_name)
-            if parsed['success']: return parsed
-    except Exception:
-        pass
-
     return None
 
 
-# ─── ГЛАВНЫЙ ЭНДПОИНТ (ПОЛНОСТЬЮ СТАТИЧНЫЙ) ──────────────────────────────────
+# ─── ГЛАВНЫЙ ЭНДПОИНТ ────────────────────────────────────────────────────────
 @app.route('/api/schedule/by_name', methods=['POST','OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -325,24 +287,24 @@ def schedule_by_name():
     week  = str(data.get('week','0'))
     if not group: return jsonify({'error': 'Не указана группа'})
 
-    # Ищем ID без использования сессий
+    # Быстрый поиск ID группы
     group_id, _, diagnostic_logs = find_group_id(group)
 
     if not group_id:
         return jsonify({
-            'header': f'Группа "{group}" не найдена или сервер вуза перегружен',
+            'header': f'Группа "{group}" не найдена',
             'days': [],
             'debug_server_logs': diagnostic_logs
         })
 
-    print(f'[SCHEDULE] Успешно получен group_id={group_id}')
+    print(f'[SCHEDULE] Нашли group_id={group_id}')
     result = call_schedule_by_id(group_id, week, group)
 
     if result and result['success']:
         return jsonify({'header': result['header'], 'days': result['days']})
 
     return jsonify({
-        'header': f'Не удалось загрузить расписание для id={group_id}',
+        'header': f'Расписание для группы {group} временно недоступно',
         'days': [],
         'debug_server_logs': diagnostic_logs
     })
