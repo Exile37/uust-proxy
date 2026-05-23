@@ -160,118 +160,34 @@ def logout():
     return jsonify({'success': True})
 
 # ==========================================
-# ОБНОВЛЕННЫЙ БЛОК: РАСПИСАНИЕ
+# НОВОЕ РАСПИСАНИЕ ПО ПРЯМОЙ ССЫЛКЕ ГРУППЫ
 # ==========================================
 
-@app.route('/api/schedule/groups', methods=['GET', 'OPTIONS'])
-def schedule_groups():
+@app.route('/api/schedule/by_name', methods=['GET', 'OPTIONS'])
+def schedule_by_name():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
         
-    faculty = request.args.get('faculty', '26')
-    groups = []
+    group_name = request.args.get('group_name', '').strip()
+    week = request.args.get('week', '0')
     
-    # Список возможных имён скриптов, которые вуз использует вместо getList.php
-    possible_urls = [
-        f'{EDU_URL}/getGroups.php?faculty={faculty}',
-        f'{EDU_URL}/getGroupsList.php?faculty={faculty}',
-        f'{EDU_URL}/getGroups.php?id={faculty}',
-        f'{EDU_URL}/getGroupList.php?faculty={faculty}'
-    ]
-    
-    for url in possible_urls:
-        try:
-            r = requests.get(url, headers=EDU_HEADERS, timeout=8)
+    if not group_name:
+        return jsonify({'error': 'Не указано имя группы'})
+        
+    try:
+        # Стучимся на прямую ссылку расписания, которую обрабатывает сервер вуза
+        direct_url = f'{EDU_URL}/index.php?group_name={group_name}&week={week}'
+        r = requests.get(direct_url, headers=EDU_HEADERS, timeout=15)
+        
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        # 1. Извлекаем текстовый заголовок (Даты недели)
+        header_text = f"Группа {group_name}"
+        rasp_head = soup.find(class_='rasp_head')
+        if rasp_head:
+            header_text = rasp_head.get_text(separator=' ', strip=True)
             
-            # Если в ответе "No input file specified", этот эндпоинт неверный, идем дальше
-            if "No input file" in r.text or r.status_code != 200:
-                continue
-                
-            # Пробуем распарсить как JSON
-            try:
-                data = r.json()
-                if isinstance(data, list):
-                    for item in data:
-                        g_id = item.get('id', item.get('value', ''))
-                        g_name = item.get('name', item.get('label', ''))
-                        if g_name:
-                            groups.append({'id': str(g_id), 'name': g_name.strip()})
-                if groups: 
-                    break
-            except ValueError:
-                # Если сервер вернул HTML-разметку кнопок/ссылок групп
-                soup = BeautifulSoup(r.text, 'html.parser')
-                
-                # Поиск кнопок или блоков с onClick или data-id
-                for el in soup.find_all(['div', 'a', 'li', 'button']):
-                    name = el.get_text(strip=True)
-                    if not name: 
-                        continue
-                    
-                    # Ищем ID в атрибутах
-                    g_id = el.get('data-id') or el.get('value')
-                    
-                    # Ищем ID в onClick событиях, например: onClick="getShedule(145)"
-                    onclick = el.get('onclick', '')
-                    if not g_id and onclick:
-                        match = re.search(r'\d+', onclick)
-                        if match: 
-                            g_id = match.group(0)
-                            
-                    href = el.get('href', '')
-                    if not g_id and 'id=' in href:
-                        match = re.search(r'id=(\d+)', href)
-                        if match:
-                            g_id = match.group(1)
-
-                    if g_id and name and len(name) < 15:
-                        groups.append({'id': str(g_id), 'name': name})
-                
-                if groups:
-                    break
-        except Exception:
-            continue
-
-    if not groups:
-        print(f"[DEBUG] Не удалось получить группы для факультета {faculty}. Проверено путей: {len(possible_urls)}")
-        # Делаем финальную попытку запросить корень расписания
-        try:
-            fallback_req = requests.get(EDU_URL, headers=EDU_HEADERS, timeout=5)
-            print("Первые 300 символов главной страницы расписания:", fallback_req.text[:300])
-        except:
-            pass
-
-    return jsonify({'groups': groups})
-
-@app.route('/api/schedule/week_header', methods=['GET', 'OPTIONS'])
-def schedule_week_header():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    group_id = request.args.get('id')
-    week = request.args.get('week', '0')
-    try:
-        r = requests.get(
-            f'{EDU_URL}/getSheduleHeader.php?type=2&id={group_id}&week={week}',
-            headers=EDU_HEADERS, timeout=15
-        )
-        soup = BeautifulSoup(r.text, 'html.parser')
-        text = soup.get_text(separator=' ', strip=True)
-        return jsonify({'header': text})
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
-@app.route('/api/schedule/timetable', methods=['GET', 'OPTIONS'])
-def schedule_timetable():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    group_id = request.args.get('id')
-    week = request.args.get('week', '0')
-    try:
-        r = requests.get(
-            f'{EDU_URL}/getShedule.php?type=2&id={group_id}&week={week}',
-            headers=EDU_HEADERS, timeout=15
-        )
-        soup = BeautifulSoup(r.text, 'html.parser')
+        # 2. Парсим сетку расписания
         days = [
             {'name': 'Понедельник', 'lessons': []},
             {'name': 'Вторник', 'lessons': []},
@@ -280,12 +196,14 @@ def schedule_timetable():
             {'name': 'Пятница', 'lessons': []},
             {'name': 'Суббота', 'lessons': []},
         ]
+        
         table = soup.find('table')
         if not table:
-            return jsonify({'days': days})
+            return jsonify({'header': header_text, 'days': days})
+            
         rows = table.find_all('tr')
-
         if rows:
+            # Обновляем даты в заголовках дней, если они есть в <th>
             headers = rows[0].find_all('th')
             for i, th in enumerate(headers):
                 if i < len(days):
@@ -300,6 +218,7 @@ def schedule_timetable():
                 if not text:
                     continue
 
+                # Регулярные выражения для вытаскивания деталей пары
                 time_match = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', cell.decode_contents())
                 time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ''
 
@@ -312,7 +231,7 @@ def schedule_timetable():
                 bold = cell.find('b') or cell.find('strong')
                 subject = bold.get_text(strip=True) if bold else ''
 
-                teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)', text)
+                teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-Я.]{3,5})', text)
                 teacher = teacher_match.group(1) if teacher_match else ''
 
                 if subject or time_str:
@@ -324,7 +243,11 @@ def schedule_timetable():
                         'room': room,
                     })
 
-        return jsonify({'days': days})
+        return jsonify({
+            'header': header_text,
+            'days': days
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)})
 
