@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, session
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+import itertools
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_123'
@@ -154,9 +155,30 @@ def logout():
     return jsonify({'success': True})
 
 
-# ==========================================
-# ЧИСТЫЙ РАБОЧИЙ ЭНДПОИНТ ЧЕРЕЗ ОФИЦИАЛЬНОЕ API ВУЗА
-# ==========================================
+# =======================================================
+#УЛЬТИМАТИВНЫЙ ПОДБОРЩИК И ПАРСЕР ОФИЦИАЛЬНОГО API ВУЗА
+# =======================================================
+
+def generate_layout_variants(text):
+    """Генерирует варианты текста с заменой К/K и М/M (рус/лат)"""
+    replacements = {
+        'К': ['К', 'K'],
+        'K': ['К', 'K'],
+        'М': ['М', 'M'],
+        'M': ['М', 'M']
+    }
+    
+    # Разбиваем строку на символы и ищем варианты замен
+    options = []
+    for char in text:
+        if char in replacements:
+            options.append(replacements[char])
+        else:
+            options.append([char])
+            
+    # Собираем все уникальные комбинации строк
+    variants = [''.join(items) for items in itertools.product(*options)]
+    return list(set(variants))
 
 @app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule_by_name():
@@ -164,65 +186,72 @@ def schedule_by_name():
         return jsonify({}), 200
         
     data = request.json or {}
-    group_name = data.get('group_name', '').strip()
+    raw_group_name = data.get('group_name', '').strip()
     week = str(data.get('week', '0'))
     
-    if not group_name:
+    if not raw_group_name:
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Шаг 1. Получаем ID группы через внутренний поиск API
-        search_url = f'{EDU_URL}/api/search?query={group_name}'
-        search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+        # Генерируем возможные написания (с дефисом и без, в разных раскладках)
+        search_queries = []
+        variants = generate_layout_variants(raw_group_name.upper())
+        for v in variants:
+            search_queries.append(v)
+            # Если ввели без дефиса (например 4М21), попробуем также вариант К-4М21
+            if not v.startswith('К-') and not v.startswith('K-'):
+                search_queries.append(f"К-{v}")
+                search_queries.append(f"K-{v}")
+
+        search_res = None
+        chosen_query = None
         
-        # Если по исходному имени ничего нет, пробуем заменить раскладку К/K
-        if not search_res or not search_res.get('groups'):
-            alt_name = group_name.replace('К', 'K') if 'К' in group_name else group_name.replace('K', 'К')
-            search_url = f'{EDU_URL}/api/search?query={alt_name}'
-            search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+        # Перебираем варианты, пока API вуза не выдаст нам id группы
+        for q in search_queries:
+            print(f"[SCHEDULE_SEARCH] Пробуем запрос к API: {q}")
+            url = f'{EDU_URL}/api/search?query={q}'
+            try:
+                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).json()
+                if res and res.get('groups'):
+                    search_res = res
+                    chosen_query = q
+                    print(f"[SCHEDULE_SEARCH] Найдено совпадение для: {chosen_query}!")
+                    break
+            except Exception:
+                continue
 
         if not search_res or not search_res.get('groups'):
-            return jsonify({'header': f'Группа "{group_name}" не найдена', 'days': []})
+            print(f"[SCHEDULE_SEARCH] Группа {raw_group_name} не найдена ни в одной раскладке")
+            return jsonify({'header': f'Группа "{raw_group_name}" не найдена', 'days': []})
             
-        # Берем ID первой совпавшей группы
         group_id = search_res['groups'][0]['id']
         real_group_title = search_res['groups'][0]['title']
         
-        # Шаг 2. Запрашиваем чистое JSON-расписание по этому ID
+        # Шаг 2. Запрашиваем чистое JSON-расписание по полученному ID
         schedule_url = f'{EDU_URL}/api/schedule?id={group_id}&week={week}'
         api_data = requests.get(schedule_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
         
-        # Шаг 3. Преобразуем формат API вуза в формат нашего мобильного приложения
-        # API возвращает 'week_range' (например "25.05.2026 - 31.05.2026")
         week_range = api_data.get('week_range', '')
         header_text = f"Группа {real_group_title} ({week_range})" if week_range else f"Группа {real_group_title}"
         
-        # Массив соответствия индексов дней недели (сервер присылает 1=Понедельник, 2=Вторник...)
         day_names = {
-            1: 'Понедельник',
-            2: 'Вторник',
-            3: 'Среда',
-            4: 'Четверг',
-            5: 'Пятница',
-            6: 'Суббота'
+            1: 'Понедельник', 2: 'Вторник', 3: 'Среда',
+            4: 'Четверг', 5: 'Пятница', 6: 'Суббота'
         }
         
         days_dict = {i: {'name': name, 'header': '', 'lessons': []} for i, name in day_names.items()}
         
-        # Наполняем пары
+        # Разбираем пары из JSON
         for lesson in api_data.get('lessons', []):
-            d_num = lesson.get('day') # Число от 1 до 6
+            d_num = lesson.get('day')
             if d_num in days_dict:
-                # Добавляем дату дня, если она пришла из API
                 if lesson.get('date') and not days_dict[d_num]['header']:
                     days_dict[d_num]['header'] = lesson.get('date')
                     
-                # Формируем красивую строку кабинета
                 room_info = lesson.get('room', '')
                 if lesson.get('building'):
                     room_info += f"-{lesson.get('building')}"
                 
-                # Тип занятия (Практика, Лекция и т.д.)
                 l_type = lesson.get('type', '')
                 subject_full = lesson.get('subject', 'Занятие')
                 if l_type:
@@ -236,7 +265,6 @@ def schedule_by_name():
                     'room': room_info
                 })
                 
-        # Сортируем уроки внутри дней по их номеру
         for d in days_dict.values():
             d['lessons'].sort(key=lambda x: x['num'])
             
@@ -246,7 +274,7 @@ def schedule_by_name():
         })
         
     except Exception as e:
-        return jsonify({'error': f'Ошибка API вуза: {str(e)}'})
+        return jsonify({'error': f'Ошибка обработки расписания: {str(e)}'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
