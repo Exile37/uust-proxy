@@ -160,8 +160,105 @@ def logout():
     return jsonify({'success': True})
 
 # ==========================================
-# НОВОЕ РАСПИСАНИЕ ПО ПРЯМОЙ ССЫЛКЕ ГРУППЫ
+# УЛЬТИМАТИВНЫЙ ПАРСЕР РАСПИСАНИЯ ПО ИМЕНИ
 # ==========================================
+
+def parse_schedule_html(html_text, group_name):
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    header_text = f"Группа {group_name}"
+    rasp_head = soup.find(class_='rasp_head')
+    if rasp_head:
+        header_text = rasp_head.get_text(separator=' ', strip=True)
+        
+    days = [
+        {'name': 'Понедельник', 'lessons': []},
+        {'name': 'Вторник', 'lessons': []},
+        {'name': 'Среда', 'lessons': []},
+        {'name': 'Четверг', 'lessons': []},
+        {'name': 'Пятница', 'lessons': []},
+        {'name': 'Суббота', 'lessons': []},
+    ]
+    
+    table = soup.find('table')
+    if not table:
+        return header_text, days, False
+        
+    rows = table.find_all('tr')
+    if not rows:
+        return header_text, days, False
+
+    # Сбор дат из шапки таблицы
+    headers = rows[0].find_all(['th', 'td'])
+    for i, th in enumerate(headers):
+        if i < len(days):
+            days[i]['header'] = th.get_text(strip=True)
+
+    has_data = False
+    for row in rows[1:]:
+        cells = row.find_all('td')
+        for i, cell in enumerate(cells):
+            if i >= len(days):
+                break
+            
+            # Собираем все строки текста внутри ячейки
+            lines = [line.strip() for line in cell.get_text(separator='\n').split('\n') if line.strip()]
+            if not lines:
+                continue
+
+            num = ""
+            time_str = ""
+            subject = ""
+            teacher = ""
+            room = ""
+
+            # Извлекаем служебную информацию (время, номер пары)
+            clean_lines = []
+            for line in lines:
+                if re.search(r'\d{2}:\d{2}', line):
+                    time_str = line
+                elif re.match(r'^\d+\s*\.$', line) or (line.isdigit() and len(line) == 1):
+                    num = line.replace('.', '').strip()
+                else:
+                    clean_lines.append(line)
+
+            if not clean_lines:
+                continue
+
+            # Определяем кабинет
+            final_lines = []
+            for line in clean_lines:
+                if any(x in line.lower() for x in ['пр', 'каб', 'ауд', 'лр', 'лек']):
+                    room = line
+                else:
+                    final_lines.append(line)
+
+            # Распределяем оставшиеся строки на Предмет и Преподавателя
+            if final_lines:
+                has_data = True
+                bold_tag = cell.find(['b', 'strong'])
+                if bold_tag:
+                    subject = bold_tag.get_text(strip=True)
+                    # Всё, что не является предметом — это преподаватель
+                    t_parts = [l for l in final_lines if l.lower() != subject.lower()]
+                    if t_parts:
+                        teacher = " ".join(t_parts)
+                else:
+                    # Если жирного текста нет, первая строка — предмет, остальное — преподаватель
+                    subject = final_lines[0]
+                    if len(final_lines) > 1:
+                        teacher = " ".join(final_lines[1:])
+
+            if subject or time_str:
+                days[i]['lessons'].append({
+                    'num': num if num else str(len(days[i]['lessons']) + 1),
+                    'time': time_str if time_str else "—",
+                    'subject': subject if subject else "Занятие",
+                    'teacher': teacher if teacher else "",
+                    'room': room if room else "",
+                })
+
+    return header_text, days, has_data
 
 @app.route('/api/schedule/by_name', methods=['GET', 'OPTIONS'])
 def schedule_by_name():
@@ -175,78 +272,27 @@ def schedule_by_name():
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Стучимся на прямую ссылку расписания, которую обрабатывает сервер вуза
-        direct_url = f'{EDU_URL}/index.php?group_name={group_name}&week={week}'
-        r = requests.get(direct_url, headers=EDU_HEADERS, timeout=15)
+        # Стратегия 1: Ищем имя в оригинальном виде (например, К-4М21)
+        url1 = f'{EDU_URL}/index.php?group_name={group_name}&week={week}'
+        r = requests.get(url1, headers=EDU_HEADERS, timeout=12)
+        header, days, success = parse_schedule_html(r.text, group_name)
         
-        soup = BeautifulSoup(r.text, 'html.parser')
-        
-        # 1. Извлекаем текстовый заголовок (Даты недели)
-        header_text = f"Группа {group_name}"
-        rasp_head = soup.find(class_='rasp_head')
-        if rasp_head:
-            header_text = rasp_head.get_text(separator=' ', strip=True)
-            
-        # 2. Парсим сетку расписания
-        days = [
-            {'name': 'Понедельник', 'lessons': []},
-            {'name': 'Вторник', 'lessons': []},
-            {'name': 'Среда', 'lessons': []},
-            {'name': 'Четверг', 'lessons': []},
-            {'name': 'Пятница', 'lessons': []},
-            {'name': 'Суббота', 'lessons': []},
-        ]
-        
-        table = soup.find('table')
-        if not table:
-            return jsonify({'header': header_text, 'days': days})
-            
-        rows = table.find_all('tr')
-        if rows:
-            # Обновляем даты в заголовках дней, если они есть в <th>
-            headers = rows[0].find_all('th')
-            for i, th in enumerate(headers):
-                if i < len(days):
-                    days[i]['header'] = th.get_text(strip=True)
+        # Стратегия 2: Если парсер пуст, пробуем подменить К (русское) на K (английское) или наоборот
+        if not success:
+            alt_name = group_name
+            if 'К' in group_name:
+                alt_name = group_name.replace('К', 'K') # Рус в Англ
+            elif 'K' in group_name:
+                alt_name = group_name.replace('K', 'К') # Англ в Рус
+                
+            if alt_name != group_name:
+                url2 = f'{EDU_URL}/index.php?group_name={alt_name}&week={week}'
+                r2 = requests.get(url2, headers=EDU_HEADERS, timeout=12)
+                h2, d2, s2 = parse_schedule_html(r2.text, group_name)
+                if s2:
+                    header, days = h2, d2
 
-        for row in rows[1:]:
-            cells = row.find_all('td')
-            for i, cell in enumerate(cells):
-                if i >= len(days):
-                    break
-                text = cell.get_text(separator='\n', strip=True)
-                if not text:
-                    continue
-
-                # Регулярные выражения для вытаскивания деталей пары
-                time_match = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', cell.decode_contents())
-                time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ''
-
-                num_match = re.match(r'^(\d+)\.', text)
-                num = num_match.group(1) if num_match else ''
-
-                room_match = re.search(r'(?:Пр|пр)\s*([^\s<,\n]+)', cell.decode_contents())
-                room = room_match.group(1) if room_match else ''
-
-                bold = cell.find('b') or cell.find('strong')
-                subject = bold.get_text(strip=True) if bold else ''
-
-                teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-Я.]{3,5})', text)
-                teacher = teacher_match.group(1) if teacher_match else ''
-
-                if subject or time_str:
-                    days[i]['lessons'].append({
-                        'num': num,
-                        'time': time_str,
-                        'subject': subject,
-                        'teacher': teacher,
-                        'room': room,
-                    })
-
-        return jsonify({
-            'header': header_text,
-            'days': days
-        })
+        return jsonify({'header': header, 'days': days})
         
     except Exception as e:
         return jsonify({'error': str(e)})
