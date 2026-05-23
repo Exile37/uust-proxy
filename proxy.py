@@ -121,7 +121,7 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── СВЕРХБЫСТРЫЙ И НАДЕЖНЫЙ ПОИСК ID ГРУППЫ ──────────────────────────────────
+# ─── ИСПРАВЛЕННЫЙ ПОИСК ID С УЧЕТОМ СКАНИРОВАНИЯ ФАКУЛЬТЕТОВ ──────────────────
 def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
     logs = {'attempts': []}
@@ -129,39 +129,36 @@ def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     s = requests.Session()
     s.headers.update(HEADERS)
 
-    # Шаг 1: Быстрая проверка общих эндпоинтов
-    targets = [
-        ('getGroups.php', {'type': 'group'}),
-        ('getData.php',   {'type': 'groups'}),
-        ('search.php',    {'query': group_name})
-    ]
-
-    for php, payload in targets:
-        try:
-            r = s.post(f'{PHP_URL}/{php}', data=payload, timeout=2)
-            preview = r.text[:100].strip()
-            logs['attempts'].append({'url': php, 'status': r.status_code, 'preview': preview})
-            
-            if r.status_code == 200 and "cannot select db" not in r.text.lower():
-                gid = extract_group_id_from_response(r.text, name_lower)
-                if gid:
-                    return gid, group_name, logs
-        except Exception as e:
-            logs['attempts'].append({'url': php, 'error': str(e)})
-
-    # Шаг 2: Пробиваем по ID факультетов через одну сессию (очень быстро)
+    # Пробегаем по возможным ID факультетов (обычно от 1 до 15)
+    # Передаем правильные параметры, чтобы скрипт вуза выплюнул список групп факультета
     for fid in range(1, 16):
         try:
-            r = s.post(f'{PHP_URL}/getData.php', data={'id': str(fid), 'type': 'groups'}, timeout=1.5)
+            # Отправляем запрос, имитирующий выбор факультета пользователем
+            r = s.post(f'{PHP_URL}/getData.php', data={'id': str(fid), 'type': 'groups'}, timeout=1.2)
+            
+            if r.status_code == 200 and "cannot select db" not in r.text.lower():
+                # Проверяем, есть ли наша группа в списке этого факультета
+                gid = extract_group_id_from_response(r.text, name_lower)
+                if gid:
+                    print(f'[FIND_ID] Группа успешно найдена на факультете ID: {fid} -> ID Группы: {gid}')
+                    logs['attempts'].append({'url': f'getData.php?faculty={fid}', 'status': 200, 'found': True})
+                    return gid, group_name, logs
+        except Exception as e:
+            continue
+
+    # Запасной вариант через getGroups.php, если первый упал
+    for fid in range(1, 16):
+        try:
+            r = s.post(f'{PHP_URL}/getGroups.php', data={'faculty': str(fid)}, timeout=1.2)
             if r.status_code == 200 and "cannot select db" not in r.text.lower():
                 gid = extract_group_id_from_response(r.text, name_lower)
                 if gid:
-                    print(f'[FIND_ID] Найдено через факультет {fid}')
-                    logs['attempts'].append({'url': f'getData.php?faculty={fid}', 'status': 200, 'found': True})
+                    print(f'[FIND_ID] Группа найдена через getGroups на факультете {fid} -> ID: {gid}')
                     return gid, group_name, logs
         except Exception:
             continue
 
+    print(f'[FIND_ID] Найти ID для группы "{group_name}" не удалось ни на одном факультете.')
     return None, None, logs
 
 
@@ -305,17 +302,16 @@ def schedule_by_name():
     week  = str(data.get('week','0'))
     if not group: return jsonify({'error': 'Не указана группа'})
 
-    # Ищем ID группы
+    # Ищем ID группы с последовательным сканированием факультетов
     group_id, _, diagnostic_logs = find_group_id(group)
 
     if not group_id:
         return jsonify({
-            'header': f'Группа "{group}" не найдена',
+            'header': f'Группа "{group}" не найдена на факультетах',
             'days': [],
             'debug_server_logs': diagnostic_logs
         })
 
-    print(f'[SCHEDULE] Нашли group_id={group_id}')
     result = call_schedule_by_id(group_id, week, group)
 
     if result and result['success']:
