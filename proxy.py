@@ -161,8 +161,9 @@ def logout():
     session.clear()
     return jsonify({'success': True})
 
+
 # ==========================================
-# НАДЕЖНЫЙ ОПРЕДЕЛИТЕЛЬ И ПАРСЕР ТАБЛИЦЫ
+# ПАРСЕР HTML ТАБЛИЦЫ РАСПИСАНИЯ СФ УУНиТ
 # ==========================================
 
 def parse_schedule_html(html_text, group_name):
@@ -190,7 +191,7 @@ def parse_schedule_html(html_text, group_name):
     if not rows:
         return header_text, days, False
 
-    # Извлечение дат для дней недели из заголовка таблицы
+    # Собираем даты из первой строки th
     headers = rows[0].find_all(['th', 'td'])
     for i, th in enumerate(headers):
         if i < len(days):
@@ -203,7 +204,6 @@ def parse_schedule_html(html_text, group_name):
             if i >= len(days):
                 break
             
-            # Извлекаем все строки текстовых блоков внутри ячейки таблицы
             lines = [line.strip() for line in cell.get_text(separator='\n').split('\n') if line.strip()]
             if not lines:
                 continue
@@ -226,7 +226,6 @@ def parse_schedule_html(html_text, group_name):
             if not clean_lines:
                 continue
 
-            # Поиск аудитории
             final_lines = []
             for line in clean_lines:
                 if any(x in line.lower() for x in ['пр', 'каб', 'ауд', 'лр', 'лек', 'лаб']):
@@ -234,7 +233,6 @@ def parse_schedule_html(html_text, group_name):
                 else:
                     final_lines.append(line)
 
-            # Выделение предмета и преподавателя
             if final_lines:
                 has_data = True
                 bold_tag = cell.find(['b', 'strong'])
@@ -259,30 +257,31 @@ def parse_schedule_html(html_text, group_name):
 
     return header_text, days, has_data
 
-@app.route('/api/schedule/by_name', methods=['GET', 'OPTIONS'])
+# МЕНЯЕМ МЕТОД ЭНДПОИНТА НА POST ДЛЯ ПРИЕМА JSON ИЗ ПРИЛОЖЕНИЯ
+@app.route('/api/schedule/by_name', methods=['POST', 'OPTIONS'])
 def schedule_by_name():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
         
-    group_name = request.args.get('group_name', '').strip()
-    week = request.args.get('week', '0')
+    data = request.json or {}
+    group_name = data.get('group_name', '').strip()
+    week = str(data.get('week', '0'))
     
     if not group_name:
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Имитируем отправку POST формы, как это делает сам сайт при поиске группы
+        # Отправляем форму POST-запросом на сайт вуза
         payload = {
             'group_name': group_name,
-            'week': str(week),
-            'type': '2' # Тип 2 на сервере вуза означает "Поиск по группе"
+            'week': week,
+            'type': '2'
         }
         
-        # Делаем POST на корневой index.php
         r = requests.post(f'{EDU_URL}/index.php', data=payload, headers=EDU_HEADERS, timeout=15)
         header, days, success = parse_schedule_html(r.text, group_name)
         
-        # Если группа не найдена (например, из-за неверной раскладки букв К/K)
+        # Если пусто — пробуем поменять раскладку буквы К (Русская/Английская)
         if not success:
             alt_name = group_name
             if 'К' in group_name:
