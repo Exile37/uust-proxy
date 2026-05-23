@@ -20,7 +20,7 @@ HEADERS = {
 
 EDU_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Referer': EDU_URL,
+    'Referer': f'{EDU_URL}/',
 }
 
 @app.after_request
@@ -160,7 +160,7 @@ def logout():
     return jsonify({'success': True})
 
 # ==========================================
-# РАСПИСАНИЕ (ОБНОВЛЕНО ПОД НОВЫЙ ПОИСК ВУЗА)
+# ОБНОВЛЕННЫЙ БЛОК: РАСПИСАНИЕ
 # ==========================================
 
 @app.route('/api/schedule/groups', methods=['GET', 'OPTIONS'])
@@ -168,66 +168,80 @@ def schedule_groups():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
         
-    # Принимаем поисковый запрос от мобильного приложения. 
-    # По умолчанию передаем символ 'И' или 'Б' (чтобы при первом открытии загрузить хоть какие-то группы)
-    search_query = request.args.get('query', 'И')
+    faculty = request.args.get('faculty', '26')
+    groups = []
     
-    try:
-        # Новый скрипт поиска групп на сайте вуза
-        search_url = f'{EDU_URL}/getGroupList.php'
-        payload = {'query': search_query}
-        
-        # Сайт принимает POST-запрос с текстом поиска
-        r = requests.post(
-            search_url,
-            data=payload,
-            headers=EDU_HEADERS,
-            timeout=15
-        )
-        
-        groups = []
-        
-        # Сценарий 1: Если вуз возвращает чистый JSON
+    # Список возможных имён скриптов, которые вуз использует вместо getList.php
+    possible_urls = [
+        f'{EDU_URL}/getGroups.php?faculty={faculty}',
+        f'{EDU_URL}/getGroupsList.php?faculty={faculty}',
+        f'{EDU_URL}/getGroups.php?id={faculty}',
+        f'{EDU_URL}/getGroupList.php?faculty={faculty}'
+    ]
+    
+    for url in possible_urls:
         try:
-            data = r.json()
-            if isinstance(data, list):
-                for item in data:
-                    g_id = item.get('id', item.get('value', ''))
-                    g_name = item.get('name', item.get('label', ''))
-                    if g_name:
-                        groups.append({'id': str(g_id), 'name': g_name.strip()})
-            elif isinstance(data, dict) and 'suggestions' in data:
-                for item in data['suggestions']:
-                    groups.append({
-                        'id': str(item.get('data', '')),
-                        'name': item.get('value', '').strip()
-                    })
-        except ValueError:
-            # Сценарий 2: Если вуз возвращает HTML-кусок (список li / option / a)
-            soup = BeautifulSoup(r.text, 'html.parser')
+            r = requests.get(url, headers=EDU_HEADERS, timeout=8)
             
-            for el in soup.find_all(['li', 'option']):
-                group_name = el.get_text(strip=True)
-                group_id = el.get('data-id') or el.get('value')
-                if group_name and group_id:
-                    groups.append({'id': str(group_id), 'name': group_name})
+            # Если в ответе "No input file specified", этот эндпоинт неверный, идем дальше
+            if "No input file" in r.text or r.status_code != 200:
+                continue
+                
+            # Пробуем распарсить как JSON
+            try:
+                data = r.json()
+                if isinstance(data, list):
+                    for item in data:
+                        g_id = item.get('id', item.get('value', ''))
+                        g_name = item.get('name', item.get('label', ''))
+                        if g_name:
+                            groups.append({'id': str(g_id), 'name': g_name.strip()})
+                if groups: 
+                    break
+            except ValueError:
+                # Если сервер вернул HTML-разметку кнопок/ссылок групп
+                soup = BeautifulSoup(r.text, 'html.parser')
+                
+                # Поиск кнопок или блоков с onClick или data-id
+                for el in soup.find_all(['div', 'a', 'li', 'button']):
+                    name = el.get_text(strip=True)
+                    if not name: 
+                        continue
                     
-            if not groups:
-                for link in soup.find_all('a'):
-                    group_name = link.get_text(strip=True)
-                    href = link.get('href', '')
-                    id_match = re.search(r'id=(\d+)', href)
-                    if group_name and id_match:
-                        groups.append({'id': id_match.group(1), 'name': group_name})
+                    # Ищем ID в атрибутах
+                    g_id = el.get('data-id') or el.get('value')
+                    
+                    # Ищем ID в onClick событиях, например: onClick="getShedule(145)"
+                    onclick = el.get('onclick', '')
+                    if not g_id and onclick:
+                        match = re.search(r'\d+', onclick)
+                        if match: 
+                            g_id = match.group(0)
+                            
+                    href = el.get('href', '')
+                    if not g_id and 'id=' in href:
+                        match = re.search(r'id=(\d+)', href)
+                        if match:
+                            g_id = match.group(1)
 
-        # Если массив пуст — логируем ответ в панель Render
-        if not groups:
-            print(f"[DEBUG] Не удалось найти группы по запросу '{search_query}'.")
-            print("Ответ сервера вуза (первые 500 символов):", r.text[:500])
+                    if g_id and name and len(name) < 15:
+                        groups.append({'id': str(g_id), 'name': name})
+                
+                if groups:
+                    break
+        except Exception:
+            continue
 
-        return jsonify({'groups': groups})
-    except Exception as e:
-        return jsonify({'error': str(e)})
+    if not groups:
+        print(f"[DEBUG] Не удалось получить группы для факультета {faculty}. Проверено путей: {len(possible_urls)}")
+        # Делаем финальную попытку запросить корень расписания
+        try:
+            fallback_req = requests.get(EDU_URL, headers=EDU_HEADERS, timeout=5)
+            print("Первые 300 символов главной страницы расписания:", fallback_req.text[:300])
+        except:
+            pass
+
+    return jsonify({'groups': groups})
 
 @app.route('/api/schedule/week_header', methods=['GET', 'OPTIONS'])
 def schedule_week_header():
