@@ -18,7 +18,6 @@ HEADERS = {
     'Origin':  EDU_URL,
     'Referer': EDU_URL + '/',
     'X-Requested-With': 'XMLHttpRequest',
-    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
 }
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
@@ -121,44 +120,34 @@ def grades():
         return jsonify({'error': str(e)})
 
 
-# ─── ИСПРАВЛЕННЫЙ ПОИСК ID С УЧЕТОМ СКАНИРОВАНИЯ ФАКУЛЬТЕТОВ ──────────────────
+# ─── ТОЧНЫЙ ПОИСК ЧЕРЕЗ getList.php ──────────────────────────────────────────
 def find_group_id(group_name: str) -> tuple[str|None, str|None, dict]:
     name_lower = group_name.lower().strip()
+    clean_name = name_lower.replace('к-', '').strip()
     logs = {'attempts': []}
     
     s = requests.Session()
     s.headers.update(HEADERS)
 
-    # Пробегаем по возможным ID факультетов (обычно от 1 до 15)
-    # Передаем правильные параметры, чтобы скрипт вуза выплюнул список групп факультета
-    for fid in range(1, 16):
+    # Приоритетно проверяем факультет 26 со скриншота, затем остальные возможные (1-40)
+    faculty_ids = [26] + [i for i in range(1, 41) if i != 26]
+
+    for fid in faculty_ids:
         try:
-            # Отправляем запрос, имитирующий выбор факультета пользователем
-            r = s.post(f'{PHP_URL}/getData.php', data={'id': str(fid), 'type': 'groups'}, timeout=1.2)
+            # Делаем GET-запрос к getList.php, как показал твой инспектор сети
+            r = s.get(f'{PHP_URL}/getList.php', params={'faculty': str(fid)}, timeout=1.5)
             
             if r.status_code == 200 and "cannot select db" not in r.text.lower():
-                # Проверяем, есть ли наша группа в списке этого факультета
                 gid = extract_group_id_from_response(r.text, name_lower)
+                if not gid and clean_name != name_lower:
+                    gid = extract_group_id_from_response(r.text, clean_name)
+                    
                 if gid:
-                    print(f'[FIND_ID] Группа успешно найдена на факультете ID: {fid} -> ID Группы: {gid}')
-                    logs['attempts'].append({'url': f'getData.php?faculty={fid}', 'status': 200, 'found': True})
+                    print(f'[FIND_ID] Группа найдена на факультете {fid} через getList! ID: {gid}')
                     return gid, group_name, logs
         except Exception as e:
             continue
 
-    # Запасной вариант через getGroups.php, если первый упал
-    for fid in range(1, 16):
-        try:
-            r = s.post(f'{PHP_URL}/getGroups.php', data={'faculty': str(fid)}, timeout=1.2)
-            if r.status_code == 200 and "cannot select db" not in r.text.lower():
-                gid = extract_group_id_from_response(r.text, name_lower)
-                if gid:
-                    print(f'[FIND_ID] Группа найдена через getGroups на факультете {fid} -> ID: {gid}')
-                    return gid, group_name, logs
-        except Exception:
-            continue
-
-    print(f'[FIND_ID] Найти ID для группы "{group_name}" не удалось ни на одном факультете.')
     return None, None, logs
 
 
@@ -170,7 +159,7 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
         if isinstance(items, list):
             for item in items:
                 if isinstance(item, dict):
-                    item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower()
+                    item_name = str(item.get('name','') or item.get('group','') or item.get('title','')).lower().strip()
                     if name_lower in item_name or item_name in name_lower:
                         return str(item.get('id') or item.get('group_id') or item.get('ID',''))
         elif isinstance(items, dict):
@@ -182,7 +171,8 @@ def extract_group_id_from_response(text: str, name_lower: str) -> str | None:
 
     try:
         soup = BeautifulSoup(text, 'html.parser')
-        for opt in soup.find_all(['option','li','a','tr','td']):
+        # Ищем совпадения в тегах option (в выпадающих списках)
+        for opt in soup.find_all(['option', 'li', 'a']):
             opt_text = opt.get_text(strip=True).lower()
             if name_lower in opt_text:
                 val = opt.get('value') or opt.get('data-id') or opt.get('id')
@@ -279,10 +269,11 @@ def parse_schedule_html(html: str, group: str) -> dict:
 
 
 def call_schedule_by_id(group_id: str, week: str, group_name: str) -> dict | None:
+    # Используем getShedule.php со скриншота
     payload = {'id': group_id, 'week': week}
-    body_endpoints = ['getSheduleBody.php', 'getShedule.php', 'getScheduleBody.php']
+    endpoints = ['getShedule.php', 'getSheduleBody.php']
     
-    for ep in body_endpoints:
+    for ep in endpoints:
         try:
             r = requests.post(f'{PHP_URL}/{ep}', data=payload, headers=HEADERS, timeout=4)
             if r.status_code == 200 and len(r.text) > 200 and "cannot select db" not in r.text.lower():
@@ -302,12 +293,11 @@ def schedule_by_name():
     week  = str(data.get('week','0'))
     if not group: return jsonify({'error': 'Не указана группа'})
 
-    # Ищем ID группы с последовательным сканированием факультетов
     group_id, _, diagnostic_logs = find_group_id(group)
 
     if not group_id:
         return jsonify({
-            'header': f'Группа "{group}" не найдена на факультетах',
+            'header': f'Группа "{group}" не найдена',
             'days': [],
             'debug_server_logs': diagnostic_logs
         })
