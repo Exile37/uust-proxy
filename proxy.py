@@ -21,6 +21,8 @@ HEADERS = {
 EDU_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Referer': f'{EDU_URL}/',
+    'Origin': EDU_URL,
+    'Content-Type': 'application/x-www-form-urlencoded'
 }
 
 @app.after_request
@@ -160,7 +162,7 @@ def logout():
     return jsonify({'success': True})
 
 # ==========================================
-# УЛЬТИМАТИВНЫЙ ПАРСЕР РАСПИСАНИЯ ПО ИМЕНИ
+# НАДЕЖНЫЙ ОПРЕДЕЛИТЕЛЬ И ПАРСЕР ТАБЛИЦЫ
 # ==========================================
 
 def parse_schedule_html(html_text, group_name):
@@ -188,7 +190,7 @@ def parse_schedule_html(html_text, group_name):
     if not rows:
         return header_text, days, False
 
-    # Сбор дат из шапки таблицы
+    # Извлечение дат для дней недели из заголовка таблицы
     headers = rows[0].find_all(['th', 'td'])
     for i, th in enumerate(headers):
         if i < len(days):
@@ -201,7 +203,7 @@ def parse_schedule_html(html_text, group_name):
             if i >= len(days):
                 break
             
-            # Собираем все строки текста внутри ячейки
+            # Извлекаем все строки текстовых блоков внутри ячейки таблицы
             lines = [line.strip() for line in cell.get_text(separator='\n').split('\n') if line.strip()]
             if not lines:
                 continue
@@ -212,7 +214,6 @@ def parse_schedule_html(html_text, group_name):
             teacher = ""
             room = ""
 
-            # Извлекаем служебную информацию (время, номер пары)
             clean_lines = []
             for line in lines:
                 if re.search(r'\d{2}:\d{2}', line):
@@ -225,26 +226,24 @@ def parse_schedule_html(html_text, group_name):
             if not clean_lines:
                 continue
 
-            # Определяем кабинет
+            # Поиск аудитории
             final_lines = []
             for line in clean_lines:
-                if any(x in line.lower() for x in ['пр', 'каб', 'ауд', 'лр', 'лек']):
+                if any(x in line.lower() for x in ['пр', 'каб', 'ауд', 'лр', 'лек', 'лаб']):
                     room = line
                 else:
                     final_lines.append(line)
 
-            # Распределяем оставшиеся строки на Предмет и Преподавателя
+            # Выделение предмета и преподавателя
             if final_lines:
                 has_data = True
                 bold_tag = cell.find(['b', 'strong'])
                 if bold_tag:
                     subject = bold_tag.get_text(strip=True)
-                    # Всё, что не является предметом — это преподаватель
                     t_parts = [l for l in final_lines if l.lower() != subject.lower()]
                     if t_parts:
                         teacher = " ".join(t_parts)
                 else:
-                    # Если жирного текста нет, первая строка — предмет, остальное — преподаватель
                     subject = final_lines[0]
                     if len(final_lines) > 1:
                         teacher = " ".join(final_lines[1:])
@@ -272,22 +271,28 @@ def schedule_by_name():
         return jsonify({'error': 'Не указано имя группы'})
         
     try:
-        # Стратегия 1: Ищем имя в оригинальном виде (например, К-4М21)
-        url1 = f'{EDU_URL}/index.php?group_name={group_name}&week={week}'
-        r = requests.get(url1, headers=EDU_HEADERS, timeout=12)
+        # Имитируем отправку POST формы, как это делает сам сайт при поиске группы
+        payload = {
+            'group_name': group_name,
+            'week': str(week),
+            'type': '2' # Тип 2 на сервере вуза означает "Поиск по группе"
+        }
+        
+        # Делаем POST на корневой index.php
+        r = requests.post(f'{EDU_URL}/index.php', data=payload, headers=EDU_HEADERS, timeout=15)
         header, days, success = parse_schedule_html(r.text, group_name)
         
-        # Стратегия 2: Если парсер пуст, пробуем подменить К (русское) на K (английское) или наоборот
+        # Если группа не найдена (например, из-за неверной раскладки букв К/K)
         if not success:
             alt_name = group_name
             if 'К' in group_name:
-                alt_name = group_name.replace('К', 'K') # Рус в Англ
+                alt_name = group_name.replace('К', 'K')
             elif 'K' in group_name:
-                alt_name = group_name.replace('K', 'К') # Англ в Рус
+                alt_name = group_name.replace('K', 'К')
                 
             if alt_name != group_name:
-                url2 = f'{EDU_URL}/index.php?group_name={alt_name}&week={week}'
-                r2 = requests.get(url2, headers=EDU_HEADERS, timeout=12)
+                payload['group_name'] = alt_name
+                r2 = requests.post(f'{EDU_URL}/index.php', data=payload, headers=EDU_HEADERS, timeout=15)
                 h2, d2, s2 = parse_schedule_html(r2.text, group_name)
                 if s2:
                     header, days = h2, d2
