@@ -108,7 +108,29 @@ def login():
         )
         if any(".AspNet" in cookie.name for cookie in client.cookies) or "Выйти" in response.text:
             session["cookies"] = requests.utils.dict_from_cookiejar(client.cookies)
-            return jsonify({"success": True})
+            group_name = None
+            try:
+                profile_soup = BeautifulSoup(response.text, "html.parser")
+                for tag in profile_soup.find_all(string=re.compile(r"Группа")):
+                    parent = tag.parent
+                    text = parent.get_text(strip=True) if parent else str(tag)
+                    match = re.search(r"Группа[:\s]+([А-ЯЁа-яёA-Za-z0-9\-]+)", text)
+                    if match:
+                        group_name = match.group(1).strip()
+                        break
+                if not group_name:
+                    profile_r = client.get(f"{BASE_URL}/", timeout=10)
+                    profile_soup2 = BeautifulSoup(profile_r.text, "html.parser")
+                    for tag in profile_soup2.find_all(string=re.compile(r"Группа")):
+                        parent = tag.parent
+                        text = parent.get_text(strip=True) if parent else str(tag)
+                        match = re.search(r"Группа[:\s]+([А-ЯЁа-яёA-Za-z0-9\-]+)", text)
+                        if match:
+                            group_name = match.group(1).strip()
+                            break
+            except Exception:
+                pass
+            return jsonify({"success": True, "group_name": group_name})
         return jsonify({"success": False, "error": "Неверный логин или пароль"})
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)})
