@@ -54,16 +54,19 @@ def health():
 @app.route("/api/debug/edu")
 def debug_edu():
     try:
+        r = requests.get(f"{EDU_PHP}/getList.php?faculty=26", headers=HEADERS, timeout=15)
+        return jsonify({"status": r.status_code, "url": r.url, "html": r.text[:1000]})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/debug/timetable")
+def debug_timetable():
+    try:
         r = requests.get(
-            f"{EDU_PHP}/getList.php?faculty=26",
-            headers=HEADERS,
-            timeout=15,
+            f"{EDU_PHP}/getShedule.php?type=2&id=10155&week=0",
+            headers=HEADERS, timeout=15
         )
-        return jsonify({
-            "status": r.status_code,
-            "url": r.url,
-            "html": r.text[:1000],
-        })
+        return jsonify({"status": r.status_code, "html": r.text[:3000]})
     except Exception as e:
         return jsonify({"error": str(e)})
 
@@ -72,11 +75,9 @@ def debug_edu():
 def login():
     if request.method == "OPTIONS":
         return jsonify({}), 200
-
     data = request.json or {}
     client = requests.Session()
     client.headers.update(AUTH_HEADERS)
-
     try:
         login_url = f"{BASE_URL}/Account/Login"
         response = client.get(login_url, timeout=15)
@@ -84,13 +85,11 @@ def login():
         form = soup.find("form")
         if not form:
             return jsonify({"success": False, "error": "Форма не найдена"})
-
         payload = {
             field.get("name"): field.get("value", "")
             for field in form.find_all("input")
             if field.get("name")
         }
-
         login_field = "Email"
         password_field = "Password"
         for key in payload:
@@ -99,22 +98,16 @@ def login():
                 login_field = key
             if "pass" in key_lower:
                 password_field = key
-
         payload[login_field] = data.get("username")
         payload[password_field] = data.get("password")
-
         response = client.post(
-            login_url,
-            data=payload,
+            login_url, data=payload,
             headers={**AUTH_HEADERS, "Referer": login_url},
-            allow_redirects=True,
-            timeout=15,
+            allow_redirects=True, timeout=15,
         )
-
         if any(".AspNet" in cookie.name for cookie in client.cookies) or "Выйти" in response.text:
             session["cookies"] = requests.utils.dict_from_cookiejar(client.cookies)
             return jsonify({"success": True})
-
         return jsonify({"success": False, "error": "Неверный логин или пароль"})
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)})
@@ -134,16 +127,13 @@ def subjects():
         return jsonify({}), 200
     if "cookies" not in session:
         return jsonify({"error": "auth"}), 401
-
     client = requests.Session()
     client.cookies.update(requests.utils.cookiejar_from_dict(session["cookies"]))
     client.headers.update(AUTH_HEADERS)
-
     try:
         response = client.get(f"{BASE_URL}/Journals/DisciplinesStudent", timeout=15)
         soup = BeautifulSoup(response.text, "html.parser")
         result = []
-
         for link in soup.find_all("a", href=True):
             if "/Journals/DisciplineGrades" not in link["href"]:
                 continue
@@ -157,7 +147,6 @@ def subjects():
                 "teacher": cells[3].get_text(strip=True) if len(cells) > 3 else "—",
                 "url": link["href"],
             })
-
         return jsonify({"subjects": list({item["url"]: item for item in result}.values())})
     except Exception as exc:
         return jsonify({"error": str(exc)})
@@ -169,21 +158,17 @@ def grades():
         return jsonify({}), 200
     if "cookies" not in session:
         return jsonify({"error": "auth"}), 401
-
     url = request.args.get("url", "")
     if not url.startswith("/Journals/"):
         return jsonify({"error": "неверный URL"})
-
     client = requests.Session()
     client.cookies.update(requests.utils.cookiejar_from_dict(session["cookies"]))
     client.headers.update(AUTH_HEADERS)
-
     try:
         response = client.get(urljoin(BASE_URL, url), timeout=15)
         soup = BeautifulSoup(response.text, "html.parser")
         lessons = []
         table = soup.find("table")
-
         if table:
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
@@ -199,7 +184,6 @@ def grades():
                     "theme": theme or "Занятие",
                     "grade": cells[-1].get_text(strip=True) or "-",
                 })
-
         return jsonify({"lessons": lessons})
     except Exception as exc:
         return jsonify({"error": str(exc)})
@@ -210,14 +194,11 @@ def grades():
 def schedule_groups():
     if request.method == "OPTIONS":
         return jsonify({}), 200
-
     faculty = request.args.get("faculty", "26")
-
     try:
         response = requests.get(
             f"{EDU_PHP}/getList.php?faculty={faculty}",
-            headers=HEADERS,
-            timeout=15,
+            headers=HEADERS, timeout=15,
         )
         html = response.text
         groups = []
@@ -239,17 +220,14 @@ def schedule_groups():
 def schedule_week_header():
     if request.method == "OPTIONS":
         return jsonify({}), 200
-
     group_id = request.args.get("id")
     week = request.args.get("week", "0")
     if not group_id:
         return jsonify({"error": "id is required"}), 400
-
     try:
         response = requests.get(
             f"{EDU_PHP}/getSheduleHeader.php?type=2&id={group_id}&week={week}",
-            headers=HEADERS,
-            timeout=15,
+            headers=HEADERS, timeout=15,
         )
         soup = BeautifulSoup(response.text, "html.parser")
         return jsonify({"header": soup.get_text(separator=" ", strip=True)})
@@ -261,17 +239,14 @@ def schedule_week_header():
 def schedule_timetable():
     if request.method == "OPTIONS":
         return jsonify({}), 200
-
     group_id = request.args.get("id")
     week = request.args.get("week", "0")
     if not group_id:
         return jsonify({"error": "id is required"}), 400
-
     try:
         response = requests.get(
             f"{EDU_PHP}/getShedule.php?type=2&id={group_id}&week={week}",
-            headers=HEADERS,
-            timeout=15,
+            headers=HEADERS, timeout=15,
         )
         soup = BeautifulSoup(response.text, "html.parser")
         days = [
@@ -282,18 +257,15 @@ def schedule_timetable():
             {"name": "Пятница", "header": "", "lessons": []},
             {"name": "Суббота", "header": "", "lessons": []},
         ]
-
         table = soup.find("table")
         if not table:
             return jsonify({"days": days})
-
         rows = table.find_all("tr")
         if rows:
             headers = rows[0].find_all("th")
             for index, header in enumerate(headers):
                 if index < len(days):
                     days[index]["header"] = header.get_text(strip=True)
-
         for row in rows[1:]:
             cells = row.find_all("td")
             for index, cell in enumerate(cells):
@@ -323,7 +295,6 @@ def schedule_timetable():
                         "teacher": teacher,
                         "room": room,
                     })
-
         return jsonify({"days": days})
     except Exception as exc:
         return jsonify({"error": str(exc)})
