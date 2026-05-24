@@ -252,52 +252,72 @@ def schedule_timetable():
             headers=HEADERS, timeout=15,
         )
         soup = BeautifulSoup(response.text, "html.parser")
-        days = [
-            {"name": "Понедельник", "header": "", "lessons": []},
-            {"name": "Вторник", "header": "", "lessons": []},
-            {"name": "Среда", "header": "", "lessons": []},
-            {"name": "Четверг", "header": "", "lessons": []},
-            {"name": "Пятница", "header": "", "lessons": []},
-            {"name": "Суббота", "header": "", "lessons": []},
-        ]
-        table = soup.find("table")
-        if not table:
-            return jsonify({"days": days})
-        rows = table.find_all("tr")
-        if rows:
-            headers = rows[0].find_all("th")
-            for index, header in enumerate(headers):
-                if index < len(days):
-                    days[index]["header"] = header.get_text(strip=True)
-        for row in rows[1:]:
-            cells = row.find_all("td")
-            for index, cell in enumerate(cells):
-                if index >= len(days):
+        days = []
+
+        for day_div in soup.find_all("div", class_="day"):
+            # Заголовок дня — <h2 class='date ...'>
+            h2 = day_div.find("h2", class_="date")
+            day_header = h2.get_text(strip=True) if h2 else ""
+
+            # Определяем название дня
+            day_name = ""
+            for d in ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"]:
+                if d in day_header:
+                    day_name = d
                     break
-                text = cell.get_text(separator="\n", strip=True)
-                if not text:
-                    continue
-                cell_html = str(cell)
-                time_match = re.search(r"(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})", cell_html)
-                time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ""
-                num_match = re.match(r"^(\d+)\.", text)
-                num = num_match.group(1) if num_match else ""
-                room_match = re.search(r"(?:Пр|пр)\s*([^\s<,\n]+)", cell_html)
-                room = room_match.group(1) if room_match else ""
-                bold = cell.find("b") or cell.find("strong")
-                subject = bold.get_text(strip=True) if bold else ""
-                teacher_match = re.search(
-                    r"([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)", text
-                )
-                teacher = teacher_match.group(1) if teacher_match else ""
-                if subject or time_str:
-                    days[index]["lessons"].append({
+            if not day_name:
+                day_name = day_header.split()[0] if day_header else "День"
+
+            lessons = []
+            for li in day_div.find_all("li", class_="lesson"):
+                # Номер пары
+                num_div = li.find("div", class_="number")
+                num_text = num_div.get_text(strip=True) if num_div else ""
+                num = num_text.replace(".", "").strip()
+                if not num:
+                    continue  # пустая пара
+
+                # Время
+                time_div = li.find("div", class_="time")
+                time_str = time_div.get_text(strip=True) if time_div else ""
+
+                # Название предмета
+                name_div = li.find("div", class_="name")
+                subject = name_div.get_text(strip=True) if name_div else ""
+
+                # Аудитория
+                cab_div = li.find("div", class_="cab")
+                room = cab_div.get_text(strip=True) if cab_div else ""
+
+                # Преподаватель
+                prep_div = li.find("div", class_="prep")
+                teacher = prep_div.get_text(strip=True) if prep_div else ""
+
+                if subject:
+                    lessons.append({
                         "num": num,
                         "time": time_str,
                         "subject": subject,
                         "teacher": teacher,
                         "room": room,
                     })
+
+            days.append({
+                "name": day_name,
+                "header": day_header,
+                "lessons": lessons,
+            })
+
+        # Если дней меньше 6 — дополняем
+        day_names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"]
+        existing = [d["name"] for d in days]
+        for dn in day_names:
+            if dn not in existing:
+                days.append({"name": dn, "header": "", "lessons": []})
+
+        # Сортируем по порядку дней недели
+        days.sort(key=lambda d: day_names.index(d["name"]) if d["name"] in day_names else 99)
+
         return jsonify({"days": days})
     except Exception as exc:
         return jsonify({"error": str(exc)})
