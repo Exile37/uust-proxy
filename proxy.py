@@ -45,11 +45,29 @@ def add_cors(response):
 @app.route("/ping")
 def ping():
     return jsonify({"status": "ok"})
-    
+
 @app.route("/")
 def health():
     return jsonify({"status": "ok", "service": "uust-proxy"})
 
+# ─── ОТЛАДКА ──────────────────────────────────────────────────────────────────
+@app.route("/api/debug/edu")
+def debug_edu():
+    try:
+        r = requests.get(
+            f"{EDU_URL}/getList.php?faculty=26",
+            headers=HEADERS,
+            timeout=15,
+        )
+        return jsonify({
+            "status": r.status_code,
+            "url": r.url,
+            "html": r.text[:1000],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
 @app.route("/api/login", methods=["POST", "OPTIONS"])
 def login():
     if request.method == "OPTIONS":
@@ -106,7 +124,6 @@ def login():
 def logout():
     if request.method == "OPTIONS":
         return jsonify({}), 200
-
     session.clear()
     return jsonify({"success": True})
 
@@ -130,23 +147,18 @@ def subjects():
         for link in soup.find_all("a", href=True):
             if "/Journals/DisciplineGrades" not in link["href"]:
                 continue
-
             row = link.find_parent("tr")
             if not row:
                 continue
-
             cells = row.find_all("td")
-            result.append(
-                {
-                    "name": cells[1].get_text(strip=True) if len(cells) > 1 else "—",
-                    "semestr": cells[2].get_text(strip=True) if len(cells) > 2 else "—",
-                    "teacher": cells[3].get_text(strip=True) if len(cells) > 3 else "—",
-                    "url": link["href"],
-                }
-            )
+            result.append({
+                "name": cells[1].get_text(strip=True) if len(cells) > 1 else "—",
+                "semestr": cells[2].get_text(strip=True) if len(cells) > 2 else "—",
+                "teacher": cells[3].get_text(strip=True) if len(cells) > 3 else "—",
+                "url": link["href"],
+            })
 
-        unique_subjects = list({item["url"]: item for item in result}.values())
-        return jsonify({"subjects": unique_subjects})
+        return jsonify({"subjects": list({item["url"]: item for item in result}.values())})
     except Exception as exc:
         return jsonify({"error": str(exc)})
 
@@ -177,26 +189,23 @@ def grades():
                 cells = row.find_all(["td", "th"])
                 if len(cells) < 3:
                     continue
-
                 date = cells[1].get_text(strip=True)
                 if not date or "Дата" in date:
                     continue
-
                 content = cells[2].get_text(separator=" ", strip=True)
                 theme = content.split("Домашнее задание:")[0].replace("Тема:", "").strip()
-                lessons.append(
-                    {
-                        "date": date,
-                        "theme": theme or "Занятие",
-                        "grade": cells[-1].get_text(strip=True) or "-",
-                    }
-                )
+                lessons.append({
+                    "date": date,
+                    "theme": theme or "Занятие",
+                    "grade": cells[-1].get_text(strip=True) or "-",
+                })
 
         return jsonify({"lessons": lessons})
     except Exception as exc:
         return jsonify({"error": str(exc)})
 
 
+# ─── РАСПИСАНИЕ ───────────────────────────────────────────────────────────────
 @app.route("/api/schedule/groups", methods=["GET", "OPTIONS"])
 def schedule_groups():
     if request.method == "OPTIONS":
@@ -216,15 +225,11 @@ def schedule_groups():
             r"<div[^>]*display\s*:\s*none[^>]*>\s*(\d+)\s*</div>\s*<a[^>]*>([^<]+)</a>",
             re.IGNORECASE,
         )
-
         for match in pattern.finditer(html):
-            groups.append(
-                {
-                    "id": match.group(1).strip(),
-                    "name": match.group(2).strip(),
-                }
-            )
-
+            groups.append({
+                "id": match.group(1).strip(),
+                "name": match.group(2).strip(),
+            })
         return jsonify({"groups": groups})
     except Exception as exc:
         return jsonify({"error": str(exc)})
@@ -294,40 +299,30 @@ def schedule_timetable():
             for index, cell in enumerate(cells):
                 if index >= len(days):
                     break
-
                 text = cell.get_text(separator="\n", strip=True)
                 if not text:
                     continue
-
                 cell_html = str(cell)
                 time_match = re.search(r"(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})", cell_html)
                 time_str = f"{time_match.group(1)} – {time_match.group(2)}" if time_match else ""
-
                 num_match = re.match(r"^(\d+)\.", text)
                 num = num_match.group(1) if num_match else ""
-
                 room_match = re.search(r"(?:Пр|пр)\s*([^\s<,\n]+)", cell_html)
                 room = room_match.group(1) if room_match else ""
-
                 bold = cell.find("b") or cell.find("strong")
                 subject = bold.get_text(strip=True) if bold else ""
-
                 teacher_match = re.search(
-                    r"([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)",
-                    text,
+                    r"([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.(?:\(\d+\))?)", text
                 )
                 teacher = teacher_match.group(1) if teacher_match else ""
-
                 if subject or time_str:
-                    days[index]["lessons"].append(
-                        {
-                            "num": num,
-                            "time": time_str,
-                            "subject": subject,
-                            "teacher": teacher,
-                            "room": room,
-                        }
-                    )
+                    days[index]["lessons"].append({
+                        "num": num,
+                        "time": time_str,
+                        "subject": subject,
+                        "teacher": teacher,
+                        "room": room,
+                    })
 
         return jsonify({"days": days})
     except Exception as exc:
