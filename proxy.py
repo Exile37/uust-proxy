@@ -11,6 +11,7 @@ app.secret_key = "super_secret_key_123"
 
 BASE_URL = "https://account.str.uust.ru"
 EDU_URL = "https://edu.str.uust.ru"
+EDU_PHP = f"{EDU_URL}/php"
 
 HEADERS = {
     "User-Agent": (
@@ -50,12 +51,11 @@ def ping():
 def health():
     return jsonify({"status": "ok", "service": "uust-proxy"})
 
-# ─── ОТЛАДКА ──────────────────────────────────────────────────────────────────
 @app.route("/api/debug/edu")
 def debug_edu():
     try:
         r = requests.get(
-            f"{EDU_URL}/getList.php?faculty=26",
+            f"{EDU_PHP}/getList.php?faculty=26",
             headers=HEADERS,
             timeout=15,
         )
@@ -215,7 +215,7 @@ def schedule_groups():
 
     try:
         response = requests.get(
-            f"{EDU_URL}/getList.php?faculty={faculty}",
+            f"{EDU_PHP}/getList.php?faculty={faculty}",
             headers=HEADERS,
             timeout=15,
         )
@@ -247,7 +247,7 @@ def schedule_week_header():
 
     try:
         response = requests.get(
-            f"{EDU_URL}/getSheduleHeader.php?type=2&id={group_id}&week={week}",
+            f"{EDU_PHP}/getSheduleHeader.php?type=2&id={group_id}&week={week}",
             headers=HEADERS,
             timeout=15,
         )
@@ -269,7 +269,7 @@ def schedule_timetable():
 
     try:
         response = requests.get(
-            f"{EDU_URL}/getShedule.php?type=2&id={group_id}&week={week}",
+            f"{EDU_PHP}/getShedule.php?type=2&id={group_id}&week={week}",
             headers=HEADERS,
             timeout=15,
         )
