@@ -62,8 +62,9 @@ def debug_edu():
 @app.route("/api/debug/timetable")
 def debug_timetable():
     try:
-        r = requests.get(
-            f"{EDU_PHP}/getShedule.php?type=2&id=10155&week=0",
+        r = requests.post(
+            f"{EDU_PHP}/getShedule.php",
+            data={"type": "2", "id": "10155", "week": "0"},
             headers=HEADERS, timeout=15
         )
         return jsonify({"status": r.status_code, "html": r.text[:3000]})
@@ -225,8 +226,9 @@ def schedule_week_header():
     if not group_id:
         return jsonify({"error": "id is required"}), 400
     try:
-        response = requests.get(
-            f"{EDU_PHP}/getSheduleHeader.php?type=2&id={group_id}&week={week}",
+        response = requests.post(
+            f"{EDU_PHP}/getSheduleHeader.php",
+            data={"type": "2", "id": group_id, "week": week},
             headers=HEADERS, timeout=15,
         )
         soup = BeautifulSoup(response.text, "html.parser")
@@ -244,8 +246,9 @@ def schedule_timetable():
     if not group_id:
         return jsonify({"error": "id is required"}), 400
     try:
-        response = requests.get(
-            f"{EDU_PHP}/getShedule.php?type=2&id={group_id}&week={week}",
+        response = requests.post(
+            f"{EDU_PHP}/getShedule.php",
+            data={"type": "2", "id": group_id, "week": week},
             headers=HEADERS, timeout=15,
         )
         soup = BeautifulSoup(response.text, "html.parser")
