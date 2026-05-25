@@ -311,6 +311,15 @@ def schedule_timetable():
                 cab_div = li.find("div", class_="cab")
                 room = cab_div.get_text(strip=True) if cab_div else ""
 
+                # Тип занятия (Пр, Лек, Тест ФЭПО и т.д.)
+                type_div = li.find("div", class_="type")
+                lesson_type = ""
+                if type_div:
+                    hidden = type_div.find("div", style=lambda s: s and "display" in s)
+                    if hidden:
+                        hidden.decompose()
+                    lesson_type = type_div.get_text(strip=True)
+
                 # Преподаватель
                 prep_div = li.find("div", class_="prep")
                 teacher = prep_div.get_text(strip=True) if prep_div else ""
@@ -322,6 +331,7 @@ def schedule_timetable():
                         "subject": subject,
                         "teacher": teacher,
                         "room": room,
+                        "type": lesson_type,
                     })
 
             days.append({
