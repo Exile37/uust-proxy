@@ -1,13 +1,15 @@
 from flask import Flask, jsonify, request, session
+from flask_compress import Compress
 import re
 from urllib.parse import urljoin
-
 import requests
 from bs4 import BeautifulSoup
 
-
 app = Flask(__name__)
 app.secret_key = "super_secret_key_123"
+
+# 1. ОПТИМИЗАЦИЯ: Включаем автоматическое Gzip-сжатие ответов ответа прокси
+Compress(app)
 
 BASE_URL = "https://account.str.uust.ru"
 EDU_URL = "https://edu.str.uust.ru"
@@ -34,6 +36,10 @@ AUTH_HEADERS = {
     )
 }
 
+# 2. ОПТИМИЗАЦИЯ: Пулинг соединений через глобальную сессию для открытых эндпоинтов расписания
+http_session = requests.Session()
+http_session.headers.update(HEADERS)
+
 
 @app.after_request
 def add_cors(response):
@@ -54,7 +60,7 @@ def health():
 @app.route("/api/debug/edu")
 def debug_edu():
     try:
-        r = requests.get(f"{EDU_PHP}/getList.php?faculty=26", headers=HEADERS, timeout=15)
+        r = http_session.get(f"{EDU_PHP}/getList.php?faculty=26", timeout=10)
         return jsonify({"status": r.status_code, "url": r.url, "html": r.text[:1000]})
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -62,10 +68,10 @@ def debug_edu():
 @app.route("/api/debug/timetable")
 def debug_timetable():
     try:
-        r = requests.post(
+        r = http_session.post(
             f"{EDU_PHP}/getShedule.php",
             data={"type": "2", "id": "10155", "week": "0"},
-            headers=HEADERS, timeout=15
+            timeout=10
         )
         return jsonify({"status": r.status_code, "html": r.text[:3000]})
     except Exception as e:
@@ -81,16 +87,20 @@ def login():
     client.headers.update(AUTH_HEADERS)
     try:
         login_url = f"{BASE_URL}/Account/Login"
-        response = client.get(login_url, timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
+        response = client.get(login_url, timeout=10)
+        
+        # 3. ОПТИМИЗАЦИЯ: Использование lxml парсера (значительно быстрее html.parser)
+        soup = BeautifulSoup(response.text, "lxml")
         form = soup.find("form")
         if not form:
             return jsonify({"success": False, "error": "Форма не найдена"})
+        
         payload = {
             field.get("name"): field.get("value", "")
             for field in form.find_all("input")
             if field.get("name")
         }
+        
         login_field = "Email"
         password_field = "Password"
         for key in payload:
@@ -99,18 +109,21 @@ def login():
                 login_field = key
             if "pass" in key_lower:
                 password_field = key
+                
         payload[login_field] = data.get("username")
         payload[password_field] = data.get("password")
+        
         response = client.post(
             login_url, data=payload,
             headers={**AUTH_HEADERS, "Referer": login_url},
-            allow_redirects=True, timeout=15,
+            allow_redirects=True, timeout=10,
         )
+        
         if any(".AspNet" in cookie.name for cookie in client.cookies) or "Выйти" in response.text:
             session["cookies"] = requests.utils.dict_from_cookiejar(client.cookies)
             group_name = None
             try:
-                profile_soup = BeautifulSoup(response.text, "html.parser")
+                profile_soup = BeautifulSoup(response.text, "lxml")
                 for tag in profile_soup.find_all(string=re.compile(r"Группа")):
                     parent = tag.parent
                     text = parent.get_text(strip=True) if parent else str(tag)
@@ -120,7 +133,7 @@ def login():
                         break
                 if not group_name:
                     profile_r = client.get(f"{BASE_URL}/", timeout=10)
-                    profile_soup2 = BeautifulSoup(profile_r.text, "html.parser")
+                    profile_soup2 = BeautifulSoup(profile_r.text, "lxml")
                     for tag in profile_soup2.find_all(string=re.compile(r"Группа")):
                         parent = tag.parent
                         text = parent.get_text(strip=True) if parent else str(tag)
@@ -150,12 +163,14 @@ def subjects():
         return jsonify({}), 200
     if "cookies" not in session:
         return jsonify({"error": "auth"}), 401
+    
     client = requests.Session()
     client.cookies.update(requests.utils.cookiejar_from_dict(session["cookies"]))
     client.headers.update(AUTH_HEADERS)
+    
     try:
-        response = client.get(f"{BASE_URL}/Journals/DisciplinesStudent", timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
+        response = client.get(f"{BASE_URL}/Journals/DisciplinesStudent", timeout=10)
+        soup = BeautifulSoup(response.text, "lxml")
         result = []
         for link in soup.find_all("a", href=True):
             if "/Journals/DisciplineGrades" not in link["href"]:
@@ -181,15 +196,18 @@ def grades():
         return jsonify({}), 200
     if "cookies" not in session:
         return jsonify({"error": "auth"}), 401
+    
     url = request.args.get("url", "")
     if not url.startswith("/Journals/"):
         return jsonify({"error": "неверный URL"})
+        
     client = requests.Session()
     client.cookies.update(requests.utils.cookiejar_from_dict(session["cookies"]))
     client.headers.update(AUTH_HEADERS)
+    
     try:
-        response = client.get(urljoin(BASE_URL, url), timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
+        response = client.get(urljoin(BASE_URL, url), timeout=10)
+        soup = BeautifulSoup(response.text, "lxml")
         lessons = []
         table = soup.find("table")
         if table:
@@ -219,9 +237,9 @@ def schedule_groups():
         return jsonify({}), 200
     faculty = request.args.get("faculty", "26")
     try:
-        response = requests.get(
-            f"{EDU_PHP}/getList.php?faculty={faculty}",
-            headers=HEADERS, timeout=15,
+        # Используем переиспользуемую HTTP-сессию
+        response = http_session.get(
+            f"{EDU_PHP}/getList.php?faculty={faculty}", timeout=10
         )
         html = response.text
         groups = []
@@ -248,12 +266,12 @@ def schedule_week_header():
     if not group_id:
         return jsonify({"error": "id is required"}), 400
     try:
-        response = requests.post(
+        response = http_session.post(
             f"{EDU_PHP}/getSheduleHeader.php",
             data={"type": "2", "id": group_id, "week": week},
-            headers=HEADERS, timeout=15,
+            timeout=10,
         )
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(response.text, "lxml")
         return jsonify({"header": soup.get_text(separator=" ", strip=True)})
     except Exception as exc:
         return jsonify({"error": str(exc)})
@@ -268,22 +286,21 @@ def schedule_timetable():
     if not group_id:
         return jsonify({"error": "id is required"}), 400
     try:
-        response = requests.post(
+        response = http_session.post(
             f"{EDU_PHP}/getShedule.php",
             data={"type": "2", "id": group_id, "week": week},
-            headers=HEADERS, timeout=15,
+            timeout=10,
         )
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(response.text, "lxml")
         days = []
+        day_names_order = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
 
         for day_div in soup.find_all("div", class_="day"):
-            # Заголовок дня — <h2 class='date ...'>
             h2 = day_div.find("h2", class_="date")
             day_header = h2.get_text(strip=True) if h2 else ""
 
-            # Определяем название дня
             day_name = ""
-            for d in ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"]:
+            for d in day_names_order:
                 if d in day_header:
                     day_name = d
                     break
@@ -292,26 +309,21 @@ def schedule_timetable():
 
             lessons = []
             for li in day_div.find_all("li", class_="lesson"):
-                # Номер пары
                 num_div = li.find("div", class_="number")
                 num_text = num_div.get_text(strip=True) if num_div else ""
                 num = num_text.replace(".", "").strip()
                 if not num:
-                    continue  # пустая пара
+                    continue
 
-                # Время
                 time_div = li.find("div", class_="time")
                 time_str = time_div.get_text(strip=True) if time_div else ""
 
-                # Название предмета
                 name_div = li.find("div", class_="name")
                 subject = name_div.get_text(strip=True) if name_div else ""
 
-                # Аудитория
                 cab_div = li.find("div", class_="cab")
                 room = cab_div.get_text(strip=True) if cab_div else ""
 
-                # Тип занятия (Пр, Лек, Тест ФЭПО и т.д.)
                 type_div = li.find("div", class_="type")
                 lesson_type = ""
                 if type_div:
@@ -320,7 +332,6 @@ def schedule_timetable():
                         hidden.decompose()
                     lesson_type = type_div.get_text(strip=True)
 
-                # Преподаватель
                 prep_div = li.find("div", class_="prep")
                 teacher = prep_div.get_text(strip=True) if prep_div else ""
 
@@ -340,15 +351,12 @@ def schedule_timetable():
                 "lessons": lessons,
             })
 
-        # Если дней меньше 6 — дополняем
-        day_names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"]
-        existing = [d["name"] for d in days]
-        for dn in day_names:
+        existing = {d["name"] for d in days}
+        for dn in day_names_order:
             if dn not in existing:
                 days.append({"name": dn, "header": "", "lessons": []})
 
-        # Сортируем по порядку дней недели
-        days.sort(key=lambda d: day_names.index(d["name"]) if d["name"] in day_names else 99)
+        days.sort(key=lambda d: day_names_order.index(d["name"]) if d["name"] in day_names_order else 99)
 
         return jsonify({"days": days})
     except Exception as exc:
@@ -356,4 +364,5 @@ def schedule_timetable():
 
 
 if __name__ == "__main__":
+    # В продакшене рекомендуется запуск через Waitress: waitress-serve --port=5000 proxy:app
     app.run(host="0.0.0.0", port=5000, debug=True)
