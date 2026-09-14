@@ -1,4 +1,6 @@
-flask
+Flask
 requests
 beautifulsoup4
+flask-compress
+lxml
 gunicorn
