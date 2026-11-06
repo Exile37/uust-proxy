@@ -1,0 +1,19 @@
+name: Keep proxy awake
+
+on:
+  schedule:
+    # Раз в 10 минут: бесплатный инстанс Render засыпает после 15 минут простоя,
+    # а просыпается 30-60 секунд. Приложение такого ожидания не выдерживает.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /ping
+        run: curl -fsS --max-time 90 https://uust-proxy.onrender.com/ping
