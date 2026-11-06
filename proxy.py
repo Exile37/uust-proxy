@@ -1,12 +1,15 @@
 from flask import Flask, jsonify, request, session
 from flask_compress import Compress
+import os
 import re
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
-app.secret_key = "super_secret_key_123"
+# Ключ подписи сессии хранит cookies журнала, поэтому берём его из окружения.
+# Без переменной остаётся старое значение, чтобы существующие сессии не слетели.
+app.secret_key = os.environ.get("SECRET_KEY", "super_secret_key_123")
 
 # 1. ОПТИМИЗАЦИЯ: Включаем автоматическое Gzip-сжатие ответов ответа прокси
 Compress(app)
